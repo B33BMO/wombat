@@ -1,15 +1,25 @@
 #!/usr/bin/env node
 
-import 'dotenv/config';
 import PubNub from 'pubnub';
 import * as readline from 'readline';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { homedir } from 'os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const CACHE_PATH = join(__dirname, '.device-cache.json');
+const CONFIG_DIR = join(homedir(), '.wombat');
+const TOKEN_PATH = join(CONFIG_DIR, 'atera-token');
+const CACHE_PATH = join(CONFIG_DIR, 'device-cache.json');
 const API_BASE = 'https://app.atera.com/proxy';
+
+// Load token from ~/.wombat/atera-token
+function loadToken() {
+  if (existsSync(TOKEN_PATH)) {
+    return readFileSync(TOKEN_PATH, 'utf8').trim();
+  }
+  return null;
+}
 
 // ANSI color codes
 const colors = {
@@ -125,24 +135,22 @@ class AteraTerminal {
   }
 
   async authenticate() {
-    // The API key from .env is the X-Api-Key for Atera's public API
-    // But for the terminal we need an Auth0 JWT token from a browser session
-    // We'll need to handle this differently - for now, check if we have a session token
+    // Load token from ~/.wombat/atera-token (synced by token server + Tampermonkey)
+    const token = loadToken();
 
-    if (process.env.ATERA_SESSION_TOKEN) {
-      this.authToken = process.env.ATERA_SESSION_TOKEN;
+    if (token) {
+      this.authToken = token;
       return true;
     }
 
-    console.error('Error: ATERA_SESSION_TOKEN not found in .env');
+    console.error('Error: No session token found');
     console.error('');
-    console.error('To get your session token:');
-    console.error('1. Open Atera in your browser');
-    console.error('2. Open DevTools (F12) → Network tab');
-    console.error('3. Navigate to a device and open PowerShell');
-    console.error('4. Find any request to app.atera.com/proxy/*');
-    console.error('5. Copy the Authorization header value (starts with "Bearer eyJ...")');
-    console.error('6. Add to .env: ATERA_SESSION_TOKEN=Bearer eyJ...');
+    console.error('To sync your token automatically:');
+    console.error('1. Start the token server: node token-server.js');
+    console.error('2. Install wombat-sync.user.js in Tampermonkey');
+    console.error('3. Open Atera in your browser');
+    console.error('');
+    console.error(`Token location: ${TOKEN_PATH}`);
     return false;
   }
 
@@ -405,15 +413,9 @@ class AteraTerminal {
       if (response.status === 401) {
         console.error('\n⚠️  Session token expired or invalid!');
         console.error('');
-        console.error('To get a fresh token:');
-        console.error('1. Open Atera in browser → Device → Manage → PowerShell');
-        console.error('2. Open DevTools (F12) → Network tab');
-        console.error('3. Find any request to app.atera.com/proxy/*');
-        console.error('4. Copy the Authorization header value');
-        console.error('5. Update .env: ATERA_SESSION_TOKEN=Bearer eyJ...');
-        console.error('');
-        console.error('Or run this in browser console on app.atera.com:');
-        console.error(`copy('Bearer ' + JSON.parse(localStorage.getItem('@@auth0spajs@@::HbcXZmOOYb5YTth9VEthKg9a056OQS8p::https://atera.com/api::openid profile email offline_access'))?.body?.access_token)`);
+        console.error('Token expired. To refresh:');
+        console.error('1. Make sure token server is running: node token-server.js');
+        console.error('2. Open Atera in browser (token will auto-sync via Tampermonkey)');
         process.exit(1);
       }
       throw new Error(`Failed to grant PubNub permission: ${response.status} - ${text}`);
@@ -1019,8 +1021,9 @@ Examples:
   wombat scripts vpn                Search for VPN-related scripts
   wombat run CheckVPNStatus mypc    Run CheckVPNStatus script on mypc
 
-Environment:
-  ATERA_SESSION_TOKEN    Browser session token (auto-synced via Tampermonkey)
+Config:
+  Token: ~/.wombat/atera-token (auto-synced via Tampermonkey + token server)
+  Cache: ~/.wombat/device-cache.json
 `);
   process.exit(0);
 }
