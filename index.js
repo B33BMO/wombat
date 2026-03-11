@@ -115,8 +115,7 @@ function highlightCommand(cmd, shellType = 'powershell') {
 }
 
 class AteraTerminal {
-  constructor(apiKey) {
-    this.apiKey = apiKey;
+  constructor() {
     this.authToken = null;
     this.pubnub = null;
     this.channelId = null;
@@ -147,37 +146,30 @@ class AteraTerminal {
     return false;
   }
 
-  async fetchDevices(search = '', page = 1, itemsInPage = 50) {
-    // Use the public API v3 with API key (more reliable than session token)
-    const params = new URLSearchParams({
-      'page': String(page),
-      'itemsInPage': String(itemsInPage)
-    });
-
-    const response = await fetch(`https://app.atera.com/api/v3/agents?${params}`, {
-      headers: {
-        'X-Api-Key': this.apiKey,
-        'Accept': 'application/json',
+  async fetchDevices(skip = 0, top = 50) {
+    // Use internal API with session token
+    const response = await fetch(
+      `${API_BASE}/devices-view/get?&$orderby=deviceName asc&$top=${top}&$skip=${skip}&$count=true`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': this.authToken,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({ advancedFilter: null })
       }
-    });
+    );
 
     if (!response.ok) {
       throw new Error(`Failed to fetch devices: ${response.status}`);
     }
 
     const data = await response.json();
-
-    // Filter client-side if search term provided
-    if (search && data.items) {
-      const searchLower = search.toLowerCase();
-      data.items = data.items.filter(d =>
-        d.MachineName?.toLowerCase().includes(searchLower) ||
-        d.CustomerName?.toLowerCase().includes(searchLower) ||
-        d.DeviceGuid?.toLowerCase().includes(searchLower)
-      );
-    }
-
-    return data;
+    return {
+      items: data.value || [],
+      totalCount: data['@odata.count'] || 0
+    };
   }
 
   loadCache() {
@@ -200,12 +192,13 @@ class AteraTerminal {
       writeFileSync(CACHE_PATH, JSON.stringify({
         timestamp: Date.now(),
         devices: devices.map(d => ({
-          name: d.MachineName,
-          guid: d.DeviceGuid,
-          customer: d.CustomerName,
-          online: d.Online,
-          user: d.CurrentLoggedUsers || null,
-          lastSeen: d.LastSeen || null
+          // Support both old API format and new internal API format
+          name: d.deviceName || d.MachineName,
+          guid: d.deviceGuid || d.DeviceGuid,
+          customer: d.customerName || d.CustomerName,
+          online: d.online ?? d.Online,
+          user: d.lastLoggedUser || d.CurrentLoggedUsers || null,
+          lastSeen: d.lastSeenDate || d.LastSeen || null
         }))
       }));
     } catch (e) {
@@ -219,7 +212,7 @@ class AteraTerminal {
     // Try cache first
     let devices = this.loadCache();
     if (!devices) {
-      // No cache - fetch all
+      // No cache - need to fetch all (fetchAllDevices handles auth)
       await this.fetchAllDevices();
       devices = this.loadCache();
     }
@@ -272,20 +265,25 @@ class AteraTerminal {
   }
 
   async fetchAllDevices() {
+    // Ensure we have auth token
+    if (!await this.authenticate()) {
+      throw new Error('Authentication required');
+    }
+
     // Fetch ALL devices and cache them
     const allDevices = [];
-    let page = 1;
-    const itemsInPage = 50;
+    let skip = 0;
+    const top = 100; // Fetch 100 at a time
 
     process.stdout.write('Fetching device list...');
     while (true) {
-      const data = await this.fetchDevices('', page, itemsInPage);
+      const data = await this.fetchDevices(skip, top);
       if (!data.items || data.items.length === 0) break;
       allDevices.push(...data.items);
-      process.stdout.write(`\rFetching device list... ${allDevices.length} devices`);
-      if (data.items.length < itemsInPage) break;
-      page++;
-      if (page > 200) break; // Safety limit (10,000 devices max)
+      process.stdout.write(`\rFetching device list... ${allDevices.length}/${data.totalCount} devices`);
+      if (allDevices.length >= data.totalCount) break;
+      skip += top;
+      if (skip > 10000) break; // Safety limit
     }
     console.log(' done!');
 
@@ -308,15 +306,17 @@ class AteraTerminal {
     // No cache - fetch all and cache
     const allDevices = await this.fetchAllDevices();
     return allDevices
-      .filter(d =>
-        d.MachineName?.toLowerCase().includes(searchLower) ||
-        d.DeviceGuid?.toLowerCase() === searchLower
-      )
+      .filter(d => {
+        const name = d.deviceName || d.MachineName || '';
+        const guid = d.deviceGuid || d.DeviceGuid || '';
+        return name.toLowerCase().includes(searchLower) ||
+               guid.toLowerCase() === searchLower;
+      })
       .map(d => ({
-        name: d.MachineName,
-        guid: d.DeviceGuid,
-        customer: d.CustomerName,
-        online: d.Online
+        name: d.deviceName || d.MachineName,
+        guid: d.deviceGuid || d.DeviceGuid,
+        customer: d.customerName || d.CustomerName,
+        online: d.online ?? d.Online
       }));
   }
 
@@ -564,6 +564,303 @@ class AteraTerminal {
     }
   }
 
+  // Script Management Methods
+  async fetchScripts() {
+    // Fetch both account and shared scripts
+    const [accountResponse, sharedResponse] = await Promise.all([
+      fetch(`${API_BASE}/atera-scripts/account-scripts`, {
+        headers: {
+          'Authorization': this.authToken,
+          'Accept': 'application/json',
+        }
+      }),
+      fetch(`${API_BASE}/atera-scripts/shared-scripts`, {
+        headers: {
+          'Authorization': this.authToken,
+          'Accept': 'application/json',
+        }
+      })
+    ]);
+
+    if (!accountResponse.ok) {
+      throw new Error(`Failed to fetch account scripts: ${accountResponse.status}`);
+    }
+    if (!sharedResponse.ok) {
+      throw new Error(`Failed to fetch shared scripts: ${sharedResponse.status}`);
+    }
+
+    const accountData = await accountResponse.json();
+    const sharedData = await sharedResponse.json();
+
+    // Handle various response structures (array or object with items/scripts property)
+    const extractScripts = (data, label) => {
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      if (data?.scripts) return data.scripts;
+      if (data?.data) return data.data;
+      // Debug: show actual structure if we can't find scripts
+      if (process.env.DEBUG) {
+        console.log(`[DEBUG] ${label} structure:`, JSON.stringify(data, null, 2).substring(0, 500));
+      }
+      // Try to find any array property
+      for (const key of Object.keys(data || {})) {
+        if (Array.isArray(data[key])) {
+          if (process.env.DEBUG) console.log(`[DEBUG] Found array in property: ${key}`);
+          return data[key];
+        }
+      }
+      return [];
+    };
+
+    const accountScripts = extractScripts(accountData, 'accountScripts');
+    const sharedScripts = extractScripts(sharedData, 'sharedScripts');
+
+    // Mark scripts with their type
+    const account = accountScripts.map(s => ({ ...s, isShared: false }));
+    const shared = sharedScripts.map(s => ({ ...s, isShared: true }));
+
+    return [...account, ...shared];
+  }
+
+  async listScripts(search = '') {
+    if (!await this.authenticate()) {
+      process.exit(1);
+    }
+
+    console.log('Fetching scripts...');
+    const scripts = await this.fetchScripts();
+
+    let filtered = scripts;
+    if (search) {
+      const searchLower = search.toLowerCase();
+      filtered = scripts.filter(s => {
+        const name = s.fileNameWithoutExtension || s.fileName || '';
+        const desc = s.description || '';
+        const category = s.category || '';
+        return name.toLowerCase().includes(searchLower) ||
+               desc.toLowerCase().includes(searchLower) ||
+               category.toLowerCase().includes(searchLower);
+      });
+    }
+
+    if (filtered.length === 0) {
+      console.log(search ? `No scripts found matching "${search}"` : 'No scripts found');
+      return;
+    }
+
+    console.log('');
+    console.log(`${colors.bold}Available Scripts:${colors.reset}`);
+    console.log('');
+
+    // Debug: show first script structure
+    if (process.env.DEBUG && filtered.length > 0) {
+      console.log('[DEBUG] Script object keys:', Object.keys(filtered[0]));
+      console.log('[DEBUG] First script:', JSON.stringify(filtered[0], null, 2).substring(0, 800));
+    }
+
+    // Group by category or just list
+    for (const script of filtered.slice(0, 50)) {
+      const typeTag = script.isShared
+        ? `${colors.cyan}[shared]${colors.reset}`
+        : `${colors.yellow}[account]${colors.reset}`;
+
+      // Property names: fileNameWithoutExtension for name, guid/scriptGuid for ID
+      const scriptName = script.fileNameWithoutExtension || script.fileName || 'Unknown';
+      const scriptId = script.guid || script.scriptGuid || 'Unknown';
+      const scriptDesc = script.description || '';
+      const category = script.category || '';
+
+      console.log(`  ${typeTag} ${colors.brightCyan}${scriptName}${colors.reset}${category ? ` ${colors.dim}(${category})${colors.reset}` : ''}`);
+      if (scriptDesc) {
+        console.log(`           ${colors.dim}${scriptDesc.substring(0, 60)}${scriptDesc.length > 60 ? '...' : ''}${colors.reset}`);
+      }
+      console.log(`           ${colors.dim}ID: ${scriptId}${colors.reset}`);
+      console.log('');
+    }
+
+    if (filtered.length > 50) {
+      console.log(`Showing 50 of ${filtered.length} scripts`);
+    } else {
+      console.log(`Found ${filtered.length} script(s)`);
+    }
+  }
+
+  async runScript(scriptName, deviceName) {
+    if (!await this.authenticate()) {
+      process.exit(1);
+    }
+
+    // Resolve device GUID
+    let agentGuid;
+    try {
+      if (deviceName.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+        agentGuid = deviceName;
+      } else {
+        agentGuid = await this.resolveDeviceGuid(deviceName);
+      }
+    } catch (e) {
+      console.error(`Error: ${e.message}`);
+      process.exit(1);
+    }
+
+    // Find the script
+    console.log('Fetching scripts...');
+    const scripts = await this.fetchScripts();
+
+    // Try exact match by GUID first
+    let script = scripts.find(s => (s.guid || s.scriptGuid) === scriptName);
+
+    // Then try name match
+    if (!script) {
+      const searchLower = scriptName.toLowerCase();
+      const matches = scripts.filter(s => {
+        const name = s.fileNameWithoutExtension || s.fileName || '';
+        return name.toLowerCase().includes(searchLower);
+      });
+
+      if (matches.length === 0) {
+        console.error(`Script "${scriptName}" not found`);
+        process.exit(1);
+      } else if (matches.length > 1) {
+        console.log(`Multiple scripts match "${scriptName}":`);
+        for (const m of matches.slice(0, 5)) {
+          const typeTag = m.isShared ? '[shared]' : '[account]';
+          const name = m.fileNameWithoutExtension || m.fileName;
+          const id = m.guid || m.scriptGuid;
+          console.log(`  ${typeTag} ${name} (${id})`);
+        }
+        if (matches.length > 5) {
+          console.log(`  ... and ${matches.length - 5} more`);
+        }
+        console.error('\nPlease be more specific or use the script ID');
+        process.exit(1);
+      }
+      script = matches[0];
+    }
+
+    const scriptDisplayName = script.fileNameWithoutExtension || script.fileName;
+    const scriptId = script.guid || script.scriptGuid;
+
+    console.log('');
+    console.log(`${colors.bold}Running script:${colors.reset} ${scriptDisplayName}`);
+    console.log(`${colors.bold}On device:${colors.reset} ${deviceName} (${agentGuid})`);
+    console.log('');
+
+    // Execute the script
+    const response = await fetch(`${API_BASE}/agents/scripts/run-script`, {
+      method: 'POST',
+      headers: {
+        'Authorization': this.authToken,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        agentGuids: [agentGuid],
+        scriptId: scriptId,
+        isSharedScript: script.isShared,
+        scriptVariableValues: [],
+        isFromGui: true,
+        packageLifetime: 'OneMinute'
+      })
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Failed to run script: ${response.status} - ${text}`);
+    }
+
+    const result = await response.json();
+    const commandId = result.commandId;
+
+    console.log(`Command ID: ${commandId}`);
+    console.log('Waiting for result...');
+    console.log('');
+
+    // Poll for completion
+    await this.pollScriptResult(commandId);
+  }
+
+  async pollScriptResult(commandId, maxAttempts = 60) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const response = await fetch(`${API_BASE}/agent/activity/by-activity-id/${commandId}`, {
+        headers: {
+          'Authorization': this.authToken,
+          'Accept': 'application/json',
+        }
+      });
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          // Not ready yet
+          process.stdout.write(`\rWaiting... ${attempt + 1}s`);
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+        throw new Error(`Failed to get script status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      process.stdout.write('\r\x1b[K'); // Clear line
+
+      if (data.status === 'Success') {
+        console.log(`${colors.brightGreen}✓ Script completed successfully${colors.reset}`);
+
+        // Try to get details if available
+        if (data.hasDetails) {
+          await this.fetchScriptDetails(commandId);
+        }
+        return;
+      } else if (data.status === 'Failed') {
+        console.log(`${colors.brightRed}✗ Script failed${colors.reset}`);
+        if (data.errorMessage) {
+          console.log(`Error: ${data.errorMessage}`);
+        }
+        if (data.hasDetails) {
+          await this.fetchScriptDetails(commandId);
+        }
+        return;
+      } else if (data.status === 'InProgress' || data.status === 'Pending') {
+        process.stdout.write(`\rStatus: ${data.status}... ${attempt + 1}s`);
+        await new Promise(r => setTimeout(r, 1000));
+      } else {
+        // Unknown status, keep polling
+        process.stdout.write(`\rStatus: ${data.status || 'Unknown'}... ${attempt + 1}s`);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    console.log('\n⚠️  Timeout waiting for script result');
+    console.log(`You can check the result manually with command ID: ${commandId}`);
+  }
+
+  async fetchScriptDetails(activityId) {
+    try {
+      const response = await fetch(`${API_BASE}/agent/activity/details/${activityId}`, {
+        headers: {
+          'Authorization': this.authToken,
+          'Accept': 'application/json',
+        }
+      });
+
+      if (response.ok) {
+        const details = await response.json();
+        if (details.output || details.standardOutput) {
+          console.log('');
+          console.log(`${colors.bold}Output:${colors.reset}`);
+          console.log('─'.repeat(40));
+          console.log(highlightOutput(details.output || details.standardOutput));
+          console.log('─'.repeat(40));
+        }
+        if (details.standardError) {
+          console.log(`${colors.brightRed}Errors:${colors.reset}`);
+          console.log(details.standardError);
+        }
+      }
+    } catch (e) {
+      // Ignore - details may not be available
+    }
+  }
+
   startInteractiveMode() {
     this.rl = readline.createInterface({
       input: process.stdin,
@@ -678,7 +975,7 @@ const args = process.argv.slice(2);
 
 if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
   console.log(`
-wombat - Atera RMM terminal
+🐻 wombat - Atera RMM terminal
 
 Usage:
   wombat sync                       Refresh device cache
@@ -687,6 +984,8 @@ Usage:
   wombat <device>                   Connect via PowerShell (as SYSTEM)
   wombat cmd <device>               Connect via CMD (as SYSTEM)
   wombat <device> --user            Run as logged-in user instead of SYSTEM
+  wombat scripts [search]           List available scripts
+  wombat run <script> <device>      Run a script on a device
 
 Examples:
   wombat sync                       Build device cache (first time)
@@ -694,9 +993,10 @@ Examples:
   wombat CYB-L00002643              Connect to device
   wombat list CYB                   Search devices matching "CYB"
   wombat cmd CYB-L00002643 --user   CMD as logged-in user
+  wombat scripts vpn                Search for VPN-related scripts
+  wombat run CheckVPNStatus mypc    Run CheckVPNStatus script on mypc
 
 Environment:
-  ATERA_API_KEY          Your Atera API key
   ATERA_SESSION_TOKEN    Browser session token (auto-synced via Tampermonkey)
 `);
   process.exit(0);
@@ -704,7 +1004,7 @@ Environment:
 
 // Handle sync command - refresh device cache
 if (args[0] === 'sync') {
-  const terminal = new AteraTerminal(process.env.ATERA_API_KEY);
+  const terminal = new AteraTerminal();
   terminal.fetchAllDevices().then(() => {
     console.log('Device cache updated!');
   }).catch(e => {
@@ -718,7 +1018,7 @@ if (args[0] === 'sync') {
     console.error('Usage: wombat who <username>');
     process.exit(1);
   }
-  const terminal = new AteraTerminal(process.env.ATERA_API_KEY);
+  const terminal = new AteraTerminal();
   terminal.whoCommand(searchTerm).catch(e => {
     console.error(`Error: ${e.message}`);
     process.exit(1);
@@ -726,8 +1026,33 @@ if (args[0] === 'sync') {
 } else if (args[0] === 'list' || args[0] === 'ls') {
   // Handle list command
   const searchTerm = args.slice(1).join(' ');
-  const terminal = new AteraTerminal(process.env.ATERA_API_KEY);
+  const terminal = new AteraTerminal();
   terminal.listDevices(searchTerm).catch(e => {
+    console.error(`Error: ${e.message}`);
+    process.exit(1);
+  });
+} else if (args[0] === 'scripts') {
+  // Handle scripts command - list available scripts
+  const searchTerm = args.slice(1).join(' ');
+  const terminal = new AteraTerminal();
+  terminal.listScripts(searchTerm).catch(e => {
+    console.error(`Error: ${e.message}`);
+    process.exit(1);
+  });
+} else if (args[0] === 'run') {
+  // Handle run command - run a script on a device
+  if (args.length < 3) {
+    console.error('Usage: wombat run <script> <device>');
+    console.error('');
+    console.error('Examples:');
+    console.error('  wombat run CheckVPNStatus CYB-L00002643');
+    console.error('  wombat run "Connect VPN" mydevice');
+    process.exit(1);
+  }
+  const scriptName = args[1];
+  const deviceName = args[2];
+  const terminal = new AteraTerminal();
+  terminal.runScript(scriptName, deviceName).catch(e => {
     console.error(`Error: ${e.message}`);
     process.exit(1);
   });
@@ -754,6 +1079,6 @@ if (args[0] === 'sync') {
     process.exit(1);
   }
 
-  const terminal = new AteraTerminal(process.env.ATERA_API_KEY);
+  const terminal = new AteraTerminal();
   terminal.connect(deviceName, shellType, runAs);
 }
