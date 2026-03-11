@@ -777,12 +777,13 @@ class AteraTerminal {
     console.log('');
 
     // Poll for completion
-    await this.pollScriptResult(commandId);
+    await this.pollScriptResult(commandId, agentGuid);
   }
 
-  async pollScriptResult(commandId, maxAttempts = 60) {
+  async pollScriptResult(commandId, agentGuid, maxAttempts = 60) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const response = await fetch(`${API_BASE}/agent/activity/by-activity-id/${commandId}`, {
+      // Poll the agent's activity list and find our command
+      const response = await fetch(`${API_BASE}/agent/${agentGuid}/activity?&top=10`, {
         headers: {
           'Authorization': this.authToken,
           'Accept': 'application/json',
@@ -790,52 +791,57 @@ class AteraTerminal {
       });
 
       if (!response.ok) {
-        if (response.status === 404) {
-          // Not ready yet
-          process.stdout.write(`\rWaiting... ${attempt + 1}s`);
-          await new Promise(r => setTimeout(r, 1000));
-          continue;
-        }
-        throw new Error(`Failed to get script status: ${response.status}`);
+        process.stdout.write(`\rWaiting... ${attempt + 1}s`);
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
       }
 
       const data = await response.json();
+      const activities = data.agentActivity || [];
+
+      // Find our command in the activity list
+      const activity = activities.find(a => a.commandId === commandId);
+
+      if (process.env.DEBUG && activity) {
+        console.log('\n[DEBUG] Activity found:', JSON.stringify(activity, null, 2));
+      }
+
+      if (!activity) {
+        process.stdout.write(`\rWaiting for activity... ${attempt + 1}s`);
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+
       process.stdout.write('\r\x1b[K'); // Clear line
 
-      if (data.status === 'Success') {
-        console.log(`${colors.brightGreen}✓ Script completed successfully${colors.reset}`);
+      const status = activity.status;
+      const activityType = activity.activityType;
 
-        // Try to get details if available
-        if (data.hasDetails) {
-          await this.fetchScriptDetails(commandId);
+      if (status === 'Success' || activityType === 'Completed') {
+        console.log(`${colors.brightGreen}Script completed successfully${colors.reset}`);
+        if (activity.hasDetails) {
+          await this.fetchScriptDetails(activity.id);
         }
         return;
-      } else if (data.status === 'Failed') {
-        console.log(`${colors.brightRed}✗ Script failed${colors.reset}`);
-        if (data.errorMessage) {
-          console.log(`Error: ${data.errorMessage}`);
-        }
-        if (data.hasDetails) {
-          await this.fetchScriptDetails(commandId);
+      } else if (status === 'Failed' || activityType === 'Failed') {
+        console.log(`${colors.brightRed}Script failed${colors.reset}`);
+        if (activity.hasDetails) {
+          await this.fetchScriptDetails(activity.id);
         }
         return;
-      } else if (data.status === 'InProgress' || data.status === 'Pending') {
-        process.stdout.write(`\rStatus: ${data.status}... ${attempt + 1}s`);
-        await new Promise(r => setTimeout(r, 1000));
       } else {
-        // Unknown status, keep polling
-        process.stdout.write(`\rStatus: ${data.status || 'Unknown'}... ${attempt + 1}s`);
+        process.stdout.write(`\rStatus: ${status || activityType || 'Pending'}... ${attempt + 1}s`);
         await new Promise(r => setTimeout(r, 1000));
       }
     }
 
-    console.log('\n⚠️  Timeout waiting for script result');
+    console.log('\nTimeout waiting for script result');
     console.log(`You can check the result manually with command ID: ${commandId}`);
   }
 
   async fetchScriptDetails(activityId) {
     try {
-      const response = await fetch(`${API_BASE}/agent/activity/details/${activityId}`, {
+      const response = await fetch(`${API_BASE}/agent/activity/${activityId}/details`, {
         headers: {
           'Authorization': this.authToken,
           'Accept': 'application/json',
@@ -843,21 +849,38 @@ class AteraTerminal {
       });
 
       if (response.ok) {
-        const details = await response.json();
-        if (details.output || details.standardOutput) {
+        const data = await response.json();
+
+        // Parse the detailsJson field
+        let details = data;
+        if (data.detailsJson) {
+          try {
+            details = JSON.parse(data.detailsJson);
+          } catch (e) {
+            details = data;
+          }
+        }
+
+        if (process.env.DEBUG) {
+          console.log('[DEBUG] Details:', JSON.stringify(details, null, 2).substring(0, 500));
+        }
+
+        if (details.output) {
           console.log('');
           console.log(`${colors.bold}Output:${colors.reset}`);
           console.log('─'.repeat(40));
-          console.log(highlightOutput(details.output || details.standardOutput));
+          console.log(highlightOutput(details.output));
           console.log('─'.repeat(40));
         }
-        if (details.standardError) {
-          console.log(`${colors.brightRed}Errors:${colors.reset}`);
-          console.log(details.standardError);
+        if (details.exitCode !== undefined) {
+          console.log(`Exit code: ${details.exitCode}`);
         }
       }
     } catch (e) {
       // Ignore - details may not be available
+      if (process.env.DEBUG) {
+        console.log('[DEBUG] Error fetching details:', e.message);
+      }
     }
   }
 
@@ -975,7 +998,7 @@ const args = process.argv.slice(2);
 
 if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
   console.log(`
-🐻 wombat - Atera RMM terminal
+wombat - Atera RMM terminal
 
 Usage:
   wombat sync                       Refresh device cache

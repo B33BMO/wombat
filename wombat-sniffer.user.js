@@ -96,6 +96,6 @@
         console.log('%c[Wombat] Cleared captured data', 'color: #ffaa00');
     };
 
-    console.log('%c🐻 Wombat API Sniffer Active', 'color: #00ff88; font-size: 14px; font-weight: bold');
+    console.log('%c[Wombat] API Sniffer Active', 'color: #00ff88; font-size: 14px; font-weight: bold');
     console.log('%cCapturing /proxy/ API calls. Run wombatExport() to get captured data.', 'color: #888');
 })();

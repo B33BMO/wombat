@@ -76,7 +76,7 @@
             data: JSON.stringify({ token }),
             onload: function(response) {
                 if (response.status === 200) {
-                    updateStatus('success', 'Synced ✓');
+                    updateStatus('success', 'Synced');
                     console.log('[Wombat] Token synced successfully');
                 }
             },
@@ -189,7 +189,7 @@
     function init() {
         statusIndicator = createStatusIndicator();
         checkServerHealth();
-        console.log('[Wombat] v2.0 - Token sync active');
+        console.log('[Wombat Token Sync] v2.0 - Intercepting API requests for token');
     }
 
     // Wait for DOM to be ready for the indicator

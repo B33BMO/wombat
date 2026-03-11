@@ -1,3 +1,4 @@
 node_modules/
 .env
 .device-cache.json
+.token-server.log

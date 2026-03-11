@@ -58,7 +58,7 @@ const server = createServer((req, res) => {
         if (data.token) {
           updateEnvToken(data.token);
           const timestamp = new Date().toLocaleTimeString();
-          console.log(`[${timestamp}] ✓ Token updated from browser`);
+          console.log(`[${timestamp}] Token updated from browser`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true }));
         } else {
@@ -104,9 +104,9 @@ server.listen(PORT, '127.0.0.1', () => {
 
   const token = getStoredToken();
   if (token) {
-    console.log('Current token: ✓ Found in .env');
+    console.log('Current token: Found in .env');
   } else {
-    console.log('Current token: ✗ Not set (waiting for browser...)');
+    console.log('Current token: Not set (waiting for browser...)');
   }
   console.log('');
 });
