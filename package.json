@@ -1,0 +1,19 @@
+{
+  "name": "wombat",
+  "version": "1.0.0",
+  "description": "CLI terminal for Atera RMM devices",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "wombat": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "server": "node token-server.js",
+    "connect": "node index.js"
+  },
+  "dependencies": {
+    "pubnub": "^7.5.0",
+    "dotenv": "^16.4.5"
+  }
+}
