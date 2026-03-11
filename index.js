@@ -203,12 +203,72 @@ class AteraTerminal {
           name: d.MachineName,
           guid: d.DeviceGuid,
           customer: d.CustomerName,
-          online: d.Online
+          online: d.Online,
+          user: d.CurrentLoggedUsers || null,
+          lastSeen: d.LastSeen || null
         }))
       }));
     } catch (e) {
       // Ignore cache errors
     }
+  }
+
+  async searchUsers(search) {
+    const searchLower = search.toLowerCase();
+
+    // Try cache first
+    let devices = this.loadCache();
+    if (!devices) {
+      // No cache - fetch all
+      await this.fetchAllDevices();
+      devices = this.loadCache();
+    }
+
+    if (!devices) return [];
+
+    // Search by user name
+    return devices.filter(d => {
+      if (!d.user) return false;
+      // Extract username from format like "DOMAIN\username (Since: ...)"
+      const userLower = d.user.toLowerCase();
+      return userLower.includes(searchLower);
+    });
+  }
+
+  async whoCommand(search) {
+    const devices = await this.searchUsers(search);
+
+    if (devices.length === 0) {
+      console.log(`No devices found with user matching "${search}"`);
+      console.log('Note: Only shows currently/recently logged-in users');
+      return;
+    }
+
+    console.log('');
+    console.log(`${colors.bold}Devices with user matching "${search}":${colors.reset}`);
+    console.log('');
+
+    for (const device of devices) {
+      const status = device.online
+        ? `${colors.brightGreen}● Online${colors.reset}`
+        : `${colors.dim}○ Offline${colors.reset}`;
+
+      // Parse user info
+      let userName = device.user || 'Unknown';
+      let loginTime = '';
+      const match = device.user?.match(/^(.+?)\s*\(Since:\s*(.+?)\)$/);
+      if (match) {
+        userName = match[1];
+        loginTime = `${colors.dim}(since ${match[2]})${colors.reset}`;
+      }
+
+      console.log(`  ${status}  ${colors.brightCyan}${device.name}${colors.reset}`);
+      console.log(`         ${colors.yellow}${userName}${colors.reset} ${loginTime}`);
+      console.log(`         ${colors.dim}${device.customer} • ${device.guid}${colors.reset}`);
+      console.log('');
+    }
+
+    console.log(`Found ${devices.length} device(s)`);
   }
 
   async fetchAllDevices() {
@@ -618,17 +678,19 @@ const args = process.argv.slice(2);
 
 if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
   console.log(`
- wombat - Atera RMM terminal
+wombat - Atera RMM terminal
 
 Usage:
-  wombat sync                       Refresh device cache (run once, instant lookups after)
-  wombat list [search]              List/search devices
+  wombat sync                       Refresh device cache
+  wombat list [search]              List/search devices by name
+  wombat who <user>                 Find devices by logged-in user
   wombat <device>                   Connect via PowerShell (as SYSTEM)
   wombat cmd <device>               Connect via CMD (as SYSTEM)
   wombat <device> --user            Run as logged-in user instead of SYSTEM
 
 Examples:
   wombat sync                       Build device cache (first time)
+  wombat who john.smith             Find John Smith's device
   wombat CYB-L00002643              Connect to device
   wombat list CYB                   Search devices matching "CYB"
   wombat cmd CYB-L00002643 --user   CMD as logged-in user
@@ -646,6 +708,18 @@ if (args[0] === 'sync') {
   terminal.fetchAllDevices().then(() => {
     console.log('Device cache updated!');
   }).catch(e => {
+    console.error(`Error: ${e.message}`);
+    process.exit(1);
+  });
+} else if (args[0] === 'who') {
+  // Handle who command - search by user
+  const searchTerm = args.slice(1).join(' ');
+  if (!searchTerm) {
+    console.error('Usage: wombat who <username>');
+    process.exit(1);
+  }
+  const terminal = new AteraTerminal(process.env.ATERA_API_KEY);
+  terminal.whoCommand(searchTerm).catch(e => {
     console.error(`Error: ${e.message}`);
     process.exit(1);
   });
