@@ -488,14 +488,17 @@ async function runAudit(config) {
   mkdirSync(dayDir, { recursive: true });
 
   // Step 1: Pull software inventory via Atera report API
-  const items = await fetchReportDirect(token);
+  let items = await fetchReportDirect(token);
 
   if (!items || items.length === 0) {
     warn('No software inventory data returned.');
     return;
   }
 
-  log(`Got ${items.length} software entries from Atera`);
+  // Filter out "Unassigned" customer — lab/unmanaged devices
+  const beforeCount = items.length;
+  items = items.filter(i => (i.CustomerName || '').toLowerCase() !== 'unassigned');
+  log(`Got ${items.length} software entries from Atera (filtered ${beforeCount - items.length} unassigned)`);
 
   // Step 2: Build software grouping and write inventory CSV (stream items then free them)
   const softwareByName = new Map();
