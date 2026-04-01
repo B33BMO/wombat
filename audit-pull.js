@@ -71,9 +71,18 @@ async function setupConfig() {
   console.log(`\n${colors.bold}Wombat Audit Setup${colors.reset}\n`);
   console.log(`Session token: ${loadToken() ? colors.green + 'Found' : colors.red + 'Missing — open Atera in browser'}${colors.reset}\n`);
 
-  const nvdKey = await ask('NIST NVD API Key (https://nvd.nist.gov/developers/request-an-api-key): ');
+  const existing = loadConfig();
 
-  const config = { nvdApiKey: nvdKey.trim() || null };
+  const nvdKey = await ask(`NIST NVD API Key${existing.nvdApiKey ? ' [keep existing]' : ''}: `);
+  const bsToken = await ask(`BookStack API Token (id:secret)${existing.bookstackToken ? ' [keep existing]' : ''}: `);
+  const bsUrl = await ask(`BookStack URL${existing.bookstackUrl ? ' [' + existing.bookstackUrl + ']' : ''}: `);
+
+  const config = {
+    ...existing,
+    nvdApiKey: nvdKey.trim() || existing.nvdApiKey || null,
+    bookstackToken: bsToken.trim() || existing.bookstackToken || null,
+    bookstackUrl: bsUrl.trim() || existing.bookstackUrl || null,
+  };
   saveConfig(config);
   rl.close();
   success(`Config saved to ${CONFIG_PATH}`);
@@ -657,6 +666,200 @@ ${colors.bold}Audit Summary — ${dateStr}${colors.reset}
   Unique CVEs:          ${summary.uniqueCVEs}
   Output:               ${dayDir}/
 `);
+
+  // Step 5: Publish to BookStack
+  await publishToBookStack(config, summary, cvePath);
+}
+
+// ---------------------------------------------------------------------------
+// BookStack Publishing
+// ---------------------------------------------------------------------------
+
+const BOOKSTACK_BOOK_SLUG = 'vulnerability-documentation';
+
+async function bookstackFetch(config, endpoint, method = 'GET', body = null) {
+  // Allow self-signed certs for LAN BookStack instances
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  const url = `${config.bookstackUrl.replace(/\/$/, '')}/api/${endpoint}`;
+  const opts = {
+    method,
+    headers: {
+      'Authorization': `Token ${config.bookstackToken}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`BookStack ${method} ${endpoint}: ${res.status} ${text.substring(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function getBookId(config) {
+  const data = await bookstackFetch(config, `books?filter[slug]=${BOOKSTACK_BOOK_SLUG}`);
+  const book = (data.data || [])[0];
+  if (!book) throw new Error(`Book "${BOOKSTACK_BOOK_SLUG}" not found in BookStack`);
+  return book.id;
+}
+
+async function findOrCreateChapter(config, bookId, chapterName) {
+  // List chapters in this book and look for existing one
+  const data = await bookstackFetch(config, `chapters?filter[book_id]=${bookId}&filter[name]=${encodeURIComponent(chapterName)}`);
+  const existing = (data.data || []).find(c => c.name === chapterName);
+  if (existing) return existing.id;
+
+  // Create new chapter
+  const chapter = await bookstackFetch(config, 'chapters', 'POST', {
+    book_id: bookId,
+    name: chapterName,
+    description: `Vulnerability audit reports for ${chapterName}`,
+  });
+  log(`Created BookStack chapter: ${chapterName}`);
+  return chapter.id;
+}
+
+function buildAuditPageHTML(summary, cvePath) {
+  // Read CVE data and build summary tables
+  const cveLines = readFileSync(cvePath, 'utf8').split('\n').filter(l => l.trim());
+  const header = cveLines[0];
+  const rows = cveLines.slice(1);
+
+  // Severity counts
+  const sevCounts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, UNKNOWN: 0 };
+  // Top CVEs by device count
+  const cveCounts = {};
+  // Per-customer breakdown
+  const customerCounts = {};
+
+  for (const row of rows) {
+    // Parse CSV row — handle quoted fields
+    const fields = [];
+    let field = '';
+    let inQuote = false;
+    for (let i = 0; i < row.length; i++) {
+      const ch = row[i];
+      if (ch === '"') { inQuote = !inQuote; continue; }
+      if (ch === ',' && !inQuote) { fields.push(field); field = ''; continue; }
+      field += ch;
+    }
+    fields.push(field);
+
+    const [cveId, severity, score, software, version, customer, device] = fields;
+
+    if (sevCounts[severity] !== undefined) sevCounts[severity]++;
+    else sevCounts['UNKNOWN']++;
+
+    if (!cveCounts[cveId]) cveCounts[cveId] = { severity, score, software, count: 0 };
+    cveCounts[cveId].count++;
+
+    if (!customerCounts[customer]) customerCounts[customer] = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, total: 0 };
+    customerCounts[customer][severity] = (customerCounts[customer][severity] || 0) + 1;
+    customerCounts[customer].total++;
+  }
+
+  const topCVEs = Object.entries(cveCounts)
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 20);
+
+  const customersSorted = Object.entries(customerCounts)
+    .sort((a, b) => b[1].CRITICAL - a[1].CRITICAL || b[1].total - a[1].total);
+
+  return `
+<h2>Audit Summary</h2>
+<table>
+  <tr><td><strong>Date</strong></td><td>${summary.date}</td></tr>
+  <tr><td><strong>Customers</strong></td><td>${summary.customers}</td></tr>
+  <tr><td><strong>Devices</strong></td><td>${summary.devices}</td></tr>
+  <tr><td><strong>Software Entries</strong></td><td>${summary.totalSoftwareEntries.toLocaleString()}</td></tr>
+  <tr><td><strong>Unique Software</strong></td><td>${summary.uniqueSoftwareNames.toLocaleString()}</td></tr>
+  <tr><td><strong>CVEs Found</strong></td><td>${summary.cvesFound.toLocaleString()}</td></tr>
+  <tr><td><strong>Unique CVEs</strong></td><td>${summary.uniqueCVEs.toLocaleString()}</td></tr>
+</table>
+
+<h2>Severity Breakdown</h2>
+<table>
+  <tr><th>Severity</th><th>Count</th></tr>
+  <tr><td><span style="color: #d32f2f;">CRITICAL</span></td><td>${sevCounts.CRITICAL.toLocaleString()}</td></tr>
+  <tr><td><span style="color: #f57c00;">HIGH</span></td><td>${sevCounts.HIGH.toLocaleString()}</td></tr>
+  <tr><td><span style="color: #fbc02d;">MEDIUM</span></td><td>${sevCounts.MEDIUM.toLocaleString()}</td></tr>
+  <tr><td><span style="color: #388e3c;">LOW</span></td><td>${sevCounts.LOW.toLocaleString()}</td></tr>
+</table>
+
+<h2>Top 20 CVEs by Affected Devices</h2>
+<table>
+  <tr><th>CVE ID</th><th>Severity</th><th>CVSS</th><th>Software</th><th>Affected Entries</th></tr>
+  ${topCVEs.map(([id, v]) => `<tr>
+    <td><a href="https://nvd.nist.gov/vuln/detail/${id}">${id}</a></td>
+    <td>${v.severity}</td>
+    <td>${v.score}</td>
+    <td>${v.software}</td>
+    <td>${v.count.toLocaleString()}</td>
+  </tr>`).join('\n  ')}
+</table>
+
+<h2>Customer Exposure</h2>
+<table>
+  <tr><th>Customer</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Total</th></tr>
+  ${customersSorted.map(([name, c]) => `<tr>
+    <td>${name}</td>
+    <td>${c.CRITICAL || 0}</td>
+    <td>${c.HIGH || 0}</td>
+    <td>${c.MEDIUM || 0}</td>
+    <td>${c.LOW || 0}</td>
+    <td>${c.total.toLocaleString()}</td>
+  </tr>`).join('\n  ')}
+</table>
+`.trim();
+}
+
+async function publishToBookStack(config, summary, cvePath) {
+  if (!config.bookstackToken || !config.bookstackUrl) {
+    warn('BookStack not configured. Run: wombat-audit setup');
+    return;
+  }
+
+  log('Publishing to BookStack...');
+
+  try {
+    const bookId = await getBookId(config);
+
+    // Chapter name: "April 2026", "March 2026", etc.
+    const [year, month] = summary.date.split('-');
+    const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const monthName = `${monthNames[parseInt(month, 10) - 1]} ${year}`;
+    const chapterId = await findOrCreateChapter(config, bookId, monthName);
+
+    // Page name: "Week of 2026-04-01" or just the date
+    const pageName = `Audit — ${summary.date}`;
+
+    // Check if page already exists (update instead of duplicate)
+    const existingPages = await bookstackFetch(config,
+      `pages?filter[chapter_id]=${chapterId}&filter[name]=${encodeURIComponent(pageName)}`);
+    const existingPage = (existingPages.data || []).find(p => p.name === pageName);
+
+    const html = buildAuditPageHTML(summary, cvePath);
+
+    if (existingPage) {
+      await bookstackFetch(config, `pages/${existingPage.id}`, 'PUT', {
+        name: pageName,
+        html,
+      });
+      success(`Updated BookStack page: ${pageName}`);
+    } else {
+      await bookstackFetch(config, 'pages', 'POST', {
+        chapter_id: chapterId,
+        name: pageName,
+        html,
+      });
+      success(`Created BookStack page: ${pageName}`);
+    }
+  } catch (e) {
+    err(`BookStack publish failed: ${e.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +880,7 @@ async function main() {
 ${colors.bold}Wombat Audit Pull${colors.reset}
 
 Usage:
-  wombat-audit setup       Configure NVD API key (interactive)
+  wombat-audit setup       Configure API keys (interactive)
   wombat-audit run         Run audit now
   wombat-audit             Same as 'run'
   wombat-audit help        Show this help
@@ -685,12 +888,14 @@ Usage:
 Requires:
   - Atera session token (auto-synced via browser + token server)
   - NIST NVD API key (optional, but recommended for speed)
+  - BookStack API token (optional, for auto-publishing reports)
 
 Output:
   ~/.wombat/audits/YYYY-MM-DD/
     software_inventory.csv   All software by customer, device, version
     cve_report.csv           CVE matches from NIST NVD
     summary.json             Run summary and stats
+  BookStack: Vulnerability Documentation > {Month Year} > Audit — {date}
 
 Config: ${CONFIG_PATH}
 `);

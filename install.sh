@@ -157,7 +157,7 @@ echo "================"
 echo ""
 
 # Setup daily audit timer
-echo "Setting up daily audit pull..."
+echo "Setting up weekly audit pull..."
 
 if [[ "$OS" == "macos" ]]; then
     AUDIT_PLIST="$HOME/Library/LaunchAgents/com.wombat.audit.plist"
@@ -177,6 +177,8 @@ if [[ "$OS" == "macos" ]]; then
     </array>
     <key>StartCalendarInterval</key>
     <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
         <key>Hour</key>
         <integer>6</integer>
         <key>Minute</key>
@@ -192,7 +194,7 @@ EOF
 
     launchctl unload "$AUDIT_PLIST" 2>/dev/null
     launchctl load "$AUDIT_PLIST"
-    echo "[OK] Daily audit scheduled at 6:00 AM (launchctl)"
+    echo "[OK] Weekly audit scheduled at Monday 6:00 AM (launchctl)"
 
 elif [[ "$OS" == "linux" ]]; then
     AUDIT_SERVICE="$SYSTEMD_DIR/wombat-audit.service"
@@ -213,10 +215,10 @@ EOF
 
     cat > "$AUDIT_TIMER" << EOF
 [Unit]
-Description=Run Wombat Audit Pull daily at 6AM
+Description=Run Wombat Audit Pull weekly on Monday at 6AM
 
 [Timer]
-OnCalendar=*-*-* 06:00:00
+OnCalendar=Mon *-*-* 06:00:00
 Persistent=true
 
 [Install]
@@ -226,7 +228,7 @@ EOF
     systemctl --user daemon-reload
     systemctl --user enable wombat-audit.timer
     systemctl --user start wombat-audit.timer
-    echo "[OK] Daily audit scheduled at 6:00 AM (systemd timer)"
+    echo "[OK] Weekly audit scheduled at Monday 6:00 AM (systemd timer)"
 
 else
     echo "[WARN] Unknown OS - daily audit not scheduled"
@@ -246,5 +248,5 @@ echo ""
 echo "Audit setup:"
 echo "  5. Run: wombat-audit setup    (configure API keys)"
 echo "  6. Run: wombat-audit run      (test it)"
-echo "  7. Daily reports at: ~/.wombat/audits/YYYY-MM-DD/"
+echo "  7. Weekly reports at: ~/.wombat/audits/YYYY-MM-DD/"
 echo ""
