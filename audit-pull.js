@@ -728,12 +728,9 @@ function buildAuditPageHTML(summary, cvePath) {
   const header = cveLines[0];
   const rows = cveLines.slice(1);
 
-  // Severity counts
-  const sevCounts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, UNKNOWN: 0 };
-  // Top CVEs by device count
-  const cveCounts = {};
-  // Per-customer breakdown
-  const customerCounts = {};
+  // Track unique CVEs globally and per-customer
+  const allCVEs = {};         // cveId -> { severity, score, software, devices: Set }
+  const customerCVEs = {};    // customer -> { CRITICAL: Set, HIGH: Set, MEDIUM: Set, LOW: Set }
 
   for (const row of rows) {
     // Parse CSV row — handle quoted fields
@@ -749,23 +746,47 @@ function buildAuditPageHTML(summary, cvePath) {
     fields.push(field);
 
     const [cveId, severity, score, software, version, customer, device] = fields;
+    if (!cveId) continue;
 
-    if (sevCounts[severity] !== undefined) sevCounts[severity]++;
-    else sevCounts['UNKNOWN']++;
+    // Track unique CVE -> unique devices affected
+    if (!allCVEs[cveId]) allCVEs[cveId] = { severity, score, software, devices: new Set() };
+    allCVEs[cveId].devices.add(device);
 
-    if (!cveCounts[cveId]) cveCounts[cveId] = { severity, score, software, count: 0 };
-    cveCounts[cveId].count++;
-
-    if (!customerCounts[customer]) customerCounts[customer] = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, total: 0 };
-    customerCounts[customer][severity] = (customerCounts[customer][severity] || 0) + 1;
-    customerCounts[customer].total++;
+    // Track unique CVEs and devices per customer per severity
+    if (!customerCVEs[customer]) customerCVEs[customer] = {
+      CRITICAL: new Set(), HIGH: new Set(), MEDIUM: new Set(), LOW: new Set(), UNKNOWN: new Set(),
+      devices: new Set(),
+    };
+    const custEntry = customerCVEs[customer];
+    const bucket = custEntry[severity] || custEntry['UNKNOWN'];
+    bucket.add(cveId);
+    custEntry.devices.add(device);
   }
 
-  const topCVEs = Object.entries(cveCounts)
+  // Severity counts (unique CVEs)
+  const sevCounts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, UNKNOWN: 0 };
+  for (const [cveId, info] of Object.entries(allCVEs)) {
+    if (sevCounts[info.severity] !== undefined) sevCounts[info.severity]++;
+    else sevCounts['UNKNOWN']++;
+  }
+
+  // Top CVEs by unique device count
+  const topCVEs = Object.entries(allCVEs)
+    .map(([id, v]) => [id, { ...v, count: v.devices.size }])
     .sort((a, b) => b[1].count - a[1].count)
     .slice(0, 20);
 
-  const customersSorted = Object.entries(customerCounts)
+  // Customer table: unique CVE counts per severity + device list
+  const customersSorted = Object.entries(customerCVEs)
+    .map(([name, sets]) => [name, {
+      CRITICAL: sets.CRITICAL.size,
+      HIGH: sets.HIGH.size,
+      MEDIUM: sets.MEDIUM.size,
+      LOW: sets.LOW.size,
+      total: new Set([...sets.CRITICAL, ...sets.HIGH, ...sets.MEDIUM, ...sets.LOW, ...sets.UNKNOWN]).size,
+      deviceCount: sets.devices.size,
+      deviceList: [...sets.devices].sort(),
+    }])
     .sort((a, b) => b[1].CRITICAL - a[1].CRITICAL || b[1].total - a[1].total);
 
   return `
@@ -780,18 +801,18 @@ function buildAuditPageHTML(summary, cvePath) {
   <tr><td><strong>Unique CVEs</strong></td><td>${summary.uniqueCVEs.toLocaleString()}</td></tr>
 </table>
 
-<h2>Severity Breakdown</h2>
+<h2>Severity Breakdown (Unique CVEs)</h2>
 <table>
-  <tr><th>Severity</th><th>Count</th></tr>
+  <tr><th>Severity</th><th>Unique CVEs</th></tr>
   <tr><td><span style="color: #d32f2f;">CRITICAL</span></td><td>${sevCounts.CRITICAL.toLocaleString()}</td></tr>
   <tr><td><span style="color: #f57c00;">HIGH</span></td><td>${sevCounts.HIGH.toLocaleString()}</td></tr>
   <tr><td><span style="color: #fbc02d;">MEDIUM</span></td><td>${sevCounts.MEDIUM.toLocaleString()}</td></tr>
   <tr><td><span style="color: #388e3c;">LOW</span></td><td>${sevCounts.LOW.toLocaleString()}</td></tr>
 </table>
 
-<h2>Top 20 CVEs by Affected Devices</h2>
+<h2>Top 20 CVEs by Devices Affected</h2>
 <table>
-  <tr><th>CVE ID</th><th>Severity</th><th>CVSS</th><th>Software</th><th>Affected Entries</th></tr>
+  <tr><th>CVE ID</th><th>Severity</th><th>CVSS</th><th>Software</th><th>Devices</th></tr>
   ${topCVEs.map(([id, v]) => `<tr>
     <td><a href="https://nvd.nist.gov/vuln/detail/${id}">${id}</a></td>
     <td>${v.severity}</td>
@@ -801,11 +822,12 @@ function buildAuditPageHTML(summary, cvePath) {
   </tr>`).join('\n  ')}
 </table>
 
-<h2>Customer Exposure</h2>
+<h2>Customer Exposure (Unique CVEs)</h2>
 <table>
-  <tr><th>Customer</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Total</th></tr>
+  <tr><th>Customer</th><th>Devices</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Total Unique CVEs</th></tr>
   ${customersSorted.map(([name, c]) => `<tr>
     <td>${name}</td>
+    <td>${c.deviceCount}</td>
     <td>${c.CRITICAL || 0}</td>
     <td>${c.HIGH || 0}</td>
     <td>${c.MEDIUM || 0}</td>
@@ -813,6 +835,14 @@ function buildAuditPageHTML(summary, cvePath) {
     <td>${c.total.toLocaleString()}</td>
   </tr>`).join('\n  ')}
 </table>
+
+<h2>Affected Devices by Customer</h2>
+${customersSorted.map(([name, c]) => `<details>
+  <summary><strong>${name}</strong> (${c.deviceCount} devices)</summary>
+  <ul>
+    ${c.deviceList.map(d => `<li>${d}</li>`).join('\n    ')}
+  </ul>
+</details>`).join('\n')}
 `.trim();
 }
 
