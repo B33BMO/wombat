@@ -5,12 +5,15 @@
   "main": "index.js",
   "type": "module",
   "bin": {
-    "wombat": "./index.js"
+    "wombat": "./index.js",
+    "wombat-audit": "./audit-pull.js"
   },
   "scripts": {
     "start": "node index.js",
     "server": "node token-server.js",
-    "connect": "node index.js"
+    "connect": "node index.js",
+    "audit": "node audit-pull.js",
+    "audit:setup": "node audit-pull.js setup"
   },
   "dependencies": {
     "pubnub": "^7.5.0",

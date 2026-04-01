@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Wombat Token Sync
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Automatically syncs Atera session token to Wombat CLI
+// @version      3.0
+// @description  Syncs Atera session token + captures API calls for Wombat CLI
 // @author       wombat
 // @match        https://app.atera.com/*
 // @grant        GM_xmlhttpRequest
@@ -18,14 +18,42 @@
     let lastToken = null;
     let statusIndicator = null;
 
-    // Intercept fetch to capture Authorization headers
+    // Capture buffer — batch API calls before sending to server
+    let captureBuffer = [];
+    let flushTimer = null;
+    const FLUSH_INTERVAL = 2000; // send every 2s
+
+    function bufferCapture(entry) {
+        captureBuffer.push(entry);
+        if (!flushTimer) {
+            flushTimer = setTimeout(flushCaptures, FLUSH_INTERVAL);
+        }
+    }
+
+    function flushCaptures() {
+        flushTimer = null;
+        if (captureBuffer.length === 0) return;
+        const batch = captureBuffer.splice(0);
+        GM_xmlhttpRequest({
+            method: 'POST',
+            url: `${SERVER_URL}/captures`,
+            headers: { 'Content-Type': 'application/json' },
+            data: JSON.stringify(batch),
+            onload: function() {},
+            onerror: function() {}
+        });
+    }
+
+    // Intercept fetch to capture Authorization headers + API calls
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
+        const request = args[0];
+        const options = args[1] || {};
+        const url = typeof request === 'string' ? request : request?.url;
+
         const response = await originalFetch.apply(this, args);
 
         try {
-            const request = args[0];
-            const options = args[1] || {};
             let authHeader = null;
 
             // Check for Authorization header
@@ -41,6 +69,20 @@
                 lastToken = authHeader;
                 syncTokenToServer(authHeader);
             }
+
+            // Capture /proxy/ API calls
+            if (url && url.includes('/proxy/')) {
+                const clone = response.clone();
+                const resBody = await clone.text().catch(() => '');
+                bufferCapture({
+                    timestamp: new Date().toISOString(),
+                    method: options.method || 'GET',
+                    url: url,
+                    requestBody: options.body || null,
+                    status: response.status,
+                    responseBody: resBody.substring(0, 4000),
+                });
+            }
         } catch (e) {
             // Ignore errors in interception
         }
@@ -48,13 +90,16 @@
         return response;
     };
 
-    // Intercept XHR to capture Authorization headers
+    // Intercept XHR to capture Authorization headers + API calls
     const originalXHROpen = XMLHttpRequest.prototype.open;
+    const originalXHRSend = XMLHttpRequest.prototype.send;
     const originalXHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
-    XMLHttpRequest.prototype.open = function(...args) {
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
         this._ateraHeaders = {};
-        return originalXHROpen.apply(this, args);
+        this._wombatMethod = method;
+        this._wombatUrl = url;
+        return originalXHROpen.call(this, method, url, ...rest);
     };
 
     XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
@@ -66,6 +111,25 @@
             }
         }
         return originalXHRSetHeader.apply(this, arguments);
+    };
+
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(body) {
+        const xhr = this;
+        const url = this._wombatUrl;
+        if (url && url.includes('/proxy/')) {
+            xhr.addEventListener('load', function() {
+                bufferCapture({
+                    timestamp: new Date().toISOString(),
+                    method: xhr._wombatMethod || 'GET',
+                    url: url,
+                    requestBody: body || null,
+                    status: xhr.status,
+                    responseBody: (xhr.responseText || '').substring(0, 4000),
+                });
+            });
+        }
+        return origSend.apply(this, arguments);
     };
 
     function syncTokenToServer(token) {

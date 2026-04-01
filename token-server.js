@@ -12,7 +12,35 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = join(homedir(), '.wombat');
 const ENV_PATH = join(CONFIG_DIR, 'atera-token');
 const UNICORN_TOKEN_PATH = join(CONFIG_DIR, 'unicorn-token');
+const CAPTURES_PATH = join(CONFIG_DIR, 'api-captures.json');
 const PORT = 7847;
+
+// API capture storage (in-memory + persisted)
+let apiCaptures = [];
+const MAX_CAPTURES = 5000;
+
+function loadCaptures() {
+  try {
+    if (existsSync(CAPTURES_PATH)) {
+      apiCaptures = JSON.parse(readFileSync(CAPTURES_PATH, 'utf8'));
+    }
+  } catch (e) { apiCaptures = []; }
+}
+
+function saveCaptures() {
+  writeFileSync(CAPTURES_PATH, JSON.stringify(apiCaptures, null, 2));
+}
+
+function addCaptures(entries) {
+  apiCaptures.push(...entries);
+  // Trim to max size
+  if (apiCaptures.length > MAX_CAPTURES) {
+    apiCaptures = apiCaptures.slice(-MAX_CAPTURES);
+  }
+  saveCaptures();
+}
+
+loadCaptures();
 
 // Ensure config directory exists
 try {
@@ -123,9 +151,66 @@ const server = createServer((req, res) => {
     return;
   }
 
+  // API capture endpoints
+  if (req.method === 'POST' && req.url === '/captures') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        const entries = Array.isArray(data) ? data : [data];
+        addCaptures(entries);
+        const timestamp = new Date().toLocaleTimeString();
+        console.log(`[${timestamp}] Captured ${entries.length} API call(s) (total: ${apiCaptures.length})`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, total: apiCaptures.length }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && req.url.startsWith('/captures')) {
+    const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+    const filter = url.searchParams.get('filter');  // filter by URL substring
+    const since = url.searchParams.get('since');    // filter by timestamp
+    const limit = parseInt(url.searchParams.get('limit')) || 0;
+    const methods = url.searchParams.get('methods'); // e.g. "GET,POST"
+
+    let results = apiCaptures;
+
+    if (filter) {
+      results = results.filter(c => c.url?.includes(filter));
+    }
+    if (since) {
+      results = results.filter(c => c.timestamp > since);
+    }
+    if (methods) {
+      const m = methods.split(',').map(s => s.trim().toUpperCase());
+      results = results.filter(c => m.includes(c.method));
+    }
+    if (limit) {
+      results = results.slice(-limit);
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ total: results.length, captures: results }));
+    return;
+  }
+
+  if (req.method === 'DELETE' && req.url === '/captures') {
+    apiCaptures = [];
+    saveCaptures();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, message: 'Captures cleared' }));
+    return;
+  }
+
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', port: PORT }));
+    res.end(JSON.stringify({ status: 'ok', port: PORT, captures: apiCaptures.length }));
     return;
   }
 
@@ -136,12 +221,16 @@ const server = createServer((req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`
 ┌─────────────────────────────────────────────────┐
-│   Auth Token Server                             │
+│   Wombat Server                                 │
 │   Listening on http://127.0.0.1:${PORT}            │
 ├─────────────────────────────────────────────────┤
 │   Endpoints:                                    │
-│     /token         - Atera tokens               │
-│     /unicorn/token - Unicorn tokens             │
+│     /token          - Atera tokens              │
+│     /unicorn/token  - Unicorn tokens            │
+│     /captures       - API call captures         │
+│       GET  ?filter=&since=&limit=&methods=      │
+│       POST (from browser sniffer)               │
+│       DELETE (clear all)                        │
 ├─────────────────────────────────────────────────┤
 │   Install Tampermonkey scripts, then open       │
 │   Atera/Unicorn in browser to sync tokens.      │

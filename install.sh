@@ -154,6 +154,87 @@ fi
 echo ""
 
 echo "================"
+echo ""
+
+# Setup daily audit timer
+echo "Setting up daily audit pull..."
+
+if [[ "$OS" == "macos" ]]; then
+    AUDIT_PLIST="$HOME/Library/LaunchAgents/com.wombat.audit.plist"
+
+    cat > "$AUDIT_PLIST" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wombat.audit</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$NODE_PATH</string>
+        <string>$SCRIPT_DIR/audit-pull.js</string>
+        <string>run</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>$HOME/.wombat/audit.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/.wombat/audit.log</string>
+</dict>
+</plist>
+EOF
+
+    launchctl unload "$AUDIT_PLIST" 2>/dev/null
+    launchctl load "$AUDIT_PLIST"
+    echo "[OK] Daily audit scheduled at 6:00 AM (launchctl)"
+
+elif [[ "$OS" == "linux" ]]; then
+    AUDIT_SERVICE="$SYSTEMD_DIR/wombat-audit.service"
+    AUDIT_TIMER="$SYSTEMD_DIR/wombat-audit.timer"
+
+    cat > "$AUDIT_SERVICE" << EOF
+[Unit]
+Description=Wombat Audit Pull - Atera software inventory & CVE scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$NODE_PATH $SCRIPT_DIR/audit-pull.js run
+StandardOutput=append:$HOME/.wombat/audit.log
+StandardError=append:$HOME/.wombat/audit.log
+EOF
+
+    cat > "$AUDIT_TIMER" << EOF
+[Unit]
+Description=Run Wombat Audit Pull daily at 6AM
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable wombat-audit.timer
+    systemctl --user start wombat-audit.timer
+    echo "[OK] Daily audit scheduled at 6:00 AM (systemd timer)"
+
+else
+    echo "[WARN] Unknown OS - daily audit not scheduled"
+    echo "       Add to crontab manually: 0 6 * * * $NODE_PATH $SCRIPT_DIR/audit-pull.js run"
+fi
+echo ""
+
+echo "================"
 echo "Installation complete!"
 echo ""
 echo "Next steps:"
@@ -161,4 +242,9 @@ echo "  1. Install the Tampermonkey script: wombat-sync.user.js"
 echo "  2. Open Atera in your browser to sync your token"
 echo "  3. Run: wombat sync"
 echo "  4. Connect: wombat <device-name>"
+echo ""
+echo "Audit setup:"
+echo "  5. Run: wombat-audit setup    (configure API keys)"
+echo "  6. Run: wombat-audit run      (test it)"
+echo "  7. Daily reports at: ~/.wombat/audits/YYYY-MM-DD/"
 echo ""
