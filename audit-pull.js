@@ -365,22 +365,31 @@ function expandCVE(c) {
 
 // Check if a CVE's CPE products are relevant to the software we're searching for
 function isCVERelevant(cve, searchName, publisher) {
-  if (!cve.cpeProducts || cve.cpeProducts.length === 0) return false; // no CPE data = can't verify relevance, skip
+  if (!cve.cpeProducts || cve.cpeProducts.length === 0) return false;
 
-  const nameLower = searchName.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
-  const nameWords = nameLower.split(/\s+/).filter(w => w.length >= 3);
-  const pubLower = (publisher || '').toLowerCase();
+  // Normalize our software name for matching
+  const nameLower = searchName.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+  const pubLower = (publisher || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
 
   for (const cp of cve.cpeProducts) {
     const [vendor, product] = cp.split(':');
-    const cpLower = (vendor + ' ' + product).replace(/_/g, ' ').toLowerCase();
+    const prodNorm = (product || '').replace(/_/g, ' ').toLowerCase();
+    const vendNorm = (vendor || '').replace(/_/g, ' ').toLowerCase();
 
-    // Check if any significant word from our software name appears in the CPE
-    for (const word of nameWords) {
-      if (cpLower.includes(word)) return true;
+    // Strategy 1: CPE product name appears in our software name (or vice versa)
+    // e.g. CPE "chrome" in "Google Chrome", CPE "7-zip" in "7-Zip"
+    if (prodNorm.length >= 3 && nameLower.includes(prodNorm)) return true;
+    if (nameLower.length >= 3 && prodNorm.includes(nameLower)) return true;
+
+    // Strategy 2: Publisher matches vendor
+    // e.g. publisher "Google LLC" matches vendor "google"
+    if (pubLower && vendNorm && vendNorm.length >= 3 && pubLower.includes(vendNorm)) {
+      // Vendor matches — also check product has some overlap with name
+      const prodWords = prodNorm.split(/\s+/).filter(w => w.length >= 3);
+      for (const pw of prodWords) {
+        if (nameLower.includes(pw)) return true;
+      }
     }
-    // Check publisher match
-    if (pubLower && vendor && pubLower.includes(vendor.replace(/_/g, ' '))) return true;
   }
 
   return false;
@@ -544,10 +553,15 @@ async function runAudit(config) {
     return;
   }
 
-  // Filter out "Unassigned" customer — lab/unmanaged devices
+  // Filter out "Unassigned" customer and stale devices (not seen in 90 days)
   const beforeCount = items.length;
-  items = items.filter(i => (i.CustomerName || '').toLowerCase() !== 'unassigned');
-  log(`Got ${items.length} software entries from Atera (filtered ${beforeCount - items.length} unassigned)`);
+  const staleDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+  items = items.filter(i => {
+    if ((i.CustomerName || '').toLowerCase() === 'unassigned') return false;
+    if (i.AgentLastSeen && i.AgentLastSeen < staleDate) return false;
+    return true;
+  });
+  log(`Got ${items.length} software entries from Atera (filtered ${beforeCount - items.length} unassigned/stale)`);
 
   // Step 2: Build software grouping and write inventory CSV (stream items then free them)
   const softwareByName = new Map();
@@ -614,7 +628,7 @@ async function runAudit(config) {
 
   // Stats for BookStack (collected during scan to avoid re-parsing huge CSV)
   const allCVEStats = {};     // cveId -> { severity, score, software, devices: Set }
-  const customerCVEStats = {}; // customer -> { CRITICAL: Set, HIGH: Set, ..., devices: Set }
+  const customerCVEStats = {}; // customer -> { CRITICAL: Set, HIGH: Set, ..., devices: Set, deviceCVEs: Map<device, Set<cveId>> }
 
   for (const normName of uniqueNames) {
     checked++;
@@ -673,11 +687,14 @@ async function runAudit(config) {
             // Collect stats
             allCVEStats[cve.cveId].devices.add(dev.device);
             if (!customerCVEStats[dev.customer]) customerCVEStats[dev.customer] = {
-              CRITICAL: new Set(), HIGH: new Set(), MEDIUM: new Set(), LOW: new Set(), UNKNOWN: new Set(), devices: new Set(),
+              CRITICAL: new Set(), HIGH: new Set(), MEDIUM: new Set(), LOW: new Set(), UNKNOWN: new Set(),
+              devices: new Set(), deviceCVEs: new Map(),
             };
             const cs = customerCVEStats[dev.customer];
             (cs[cve.severity] || cs.UNKNOWN).add(cve.cveId);
             cs.devices.add(dev.device);
+            if (!cs.deviceCVEs.has(dev.device)) cs.deviceCVEs.set(dev.device, new Set());
+            cs.deviceCVEs.get(dev.device).add(cve.cveId);
           }
         }
       }
@@ -738,16 +755,36 @@ ${colors.bold}Audit Summary — ${dateStr}${colors.reset}
     .sort((a, b) => b[1].count - a[1].count)
     .slice(0, 20);
 
+  // Build a lookup: cveId -> { severity, score }
+  const cveSevLookup = {};
+  for (const [id, info] of Object.entries(allCVEStats)) {
+    cveSevLookup[id] = { severity: info.severity, score: info.score };
+  }
+
   const customersSorted = Object.entries(customerCVEStats)
-    .map(([name, sets]) => [name, {
-      CRITICAL: sets.CRITICAL.size,
-      HIGH: sets.HIGH.size,
-      MEDIUM: sets.MEDIUM.size,
-      LOW: sets.LOW.size,
-      total: new Set([...sets.CRITICAL, ...sets.HIGH, ...sets.MEDIUM, ...sets.LOW, ...sets.UNKNOWN]).size,
-      deviceCount: sets.devices.size,
-      deviceList: [...sets.devices].sort(),
-    }])
+    .map(([name, sets]) => {
+      // Build per-device CVE list grouped by severity
+      const deviceDetails = [...sets.deviceCVEs.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([device, cveIds]) => {
+          const bySev = { CRITICAL: [], HIGH: [], MEDIUM: [], LOW: [] };
+          for (const id of cveIds) {
+            const sev = cveSevLookup[id]?.severity || 'UNKNOWN';
+            if (bySev[sev]) bySev[sev].push(id);
+          }
+          return { device, cveCount: cveIds.size, bySev };
+        });
+
+      return [name, {
+        CRITICAL: sets.CRITICAL.size,
+        HIGH: sets.HIGH.size,
+        MEDIUM: sets.MEDIUM.size,
+        LOW: sets.LOW.size,
+        total: new Set([...sets.CRITICAL, ...sets.HIGH, ...sets.MEDIUM, ...sets.LOW, ...sets.UNKNOWN]).size,
+        deviceCount: sets.devices.size,
+        deviceDetails,
+      }];
+    })
     .sort((a, b) => b[1].CRITICAL - a[1].CRITICAL || b[1].total - a[1].total);
 
   const auditStats = { sevCounts, topCVEs, customersSorted };
@@ -857,12 +894,34 @@ function buildAuditPageHTML(summary, auditStats) {
 </table>
 
 <h2>Affected Devices by Customer</h2>
-${customersSorted.map(([name, c]) => `<details>
-  <summary><strong>${name}</strong> (${c.deviceCount} devices)</summary>
-  <ul>
-    ${c.deviceList.map(d => `<li>${d}</li>`).join('\n    ')}
-  </ul>
-</details>`).join('\n')}
+${customersSorted.map(([name, c]) => {
+  const MAX_CVES_SHOWN = 10;
+  function formatSevRow(label, color, ids) {
+    if (!ids.length) return '';
+    const shown = ids.slice(0, MAX_CVES_SHOWN).map(id => '<a href="https://nvd.nist.gov/vuln/detail/' + id + '">' + id + '</a>').join(', ');
+    const extra = ids.length > MAX_CVES_SHOWN ? ' <em>+ ' + (ids.length - MAX_CVES_SHOWN) + ' more</em>' : '';
+    return '<tr><td><span style="color:' + color + ';">' + label + ' (' + ids.length + ')</span></td><td>' + shown + extra + '</td></tr>';
+  }
+  return '<details>' +
+    '<summary><strong>' + name + '</strong> (' + c.deviceCount + ' devices, ' + c.total + ' unique CVEs)</summary>' +
+    c.deviceDetails.map(d =>
+      '<details style="margin-left:20px;">' +
+        '<summary>' + d.device + ' — ' +
+          (d.bySev.CRITICAL.length ? '<span style="color:#d32f2f;">' + d.bySev.CRITICAL.length + 'C</span> ' : '') +
+          (d.bySev.HIGH.length ? '<span style="color:#f57c00;">' + d.bySev.HIGH.length + 'H</span> ' : '') +
+          (d.bySev.MEDIUM.length ? d.bySev.MEDIUM.length + 'M ' : '') +
+          (d.bySev.LOW.length ? d.bySev.LOW.length + 'L' : '') +
+        '</summary>' +
+        '<table><tr><th>Severity</th><th>CVEs</th></tr>' +
+        formatSevRow('CRITICAL', '#d32f2f', d.bySev.CRITICAL) +
+        formatSevRow('HIGH', '#f57c00', d.bySev.HIGH) +
+        '</table>' +
+        (d.bySev.MEDIUM.length + d.bySev.LOW.length > 0 ?
+          '<p><em>' + d.bySev.MEDIUM.length + ' Medium, ' + d.bySev.LOW.length + ' Low (see CSV for details)</em></p>' : '') +
+      '</details>'
+    ).join('') +
+  '</details>';
+}).join('\n')}
 `.trim();
 }
 
