@@ -330,14 +330,14 @@ function slimCVE(cve) {
       ei: r.versionEndIncluding || undefined,
       ee: r.versionEndExcluding || undefined,
     })).filter(r => r.si || r.se || r.ei || r.ee),
+    cp: cve.cpeProducts || [],  // vendor:product pairs for relevance filtering
   };
 }
 
 // Expand compact cache entry back to full format
 const SEV_MAP = { C: 'CRITICAL', H: 'HIGH', M: 'MEDIUM', L: 'LOW', U: 'UNKNOWN' };
 function expandCVE(c) {
-  // Handle both compact (i/s/c/d/p/v) and full (cveId/severity/...) formats
-  if (c.cveId) return c; // already full format
+  if (c.cveId) return c;
   return {
     cveId: c.i,
     severity: SEV_MAP[c.s] || 'UNKNOWN',
@@ -350,7 +350,31 @@ function expandCVE(c) {
       versionEndIncluding: r.ei || null,
       versionEndExcluding: r.ee || null,
     })),
+    cpeProducts: c.cp || [],
   };
+}
+
+// Check if a CVE's CPE products are relevant to the software we're searching for
+function isCVERelevant(cve, searchName, publisher) {
+  if (!cve.cpeProducts || cve.cpeProducts.length === 0) return true; // no CPE data, can't filter
+
+  const nameLower = searchName.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
+  const nameWords = nameLower.split(/\s+/).filter(w => w.length >= 2);
+  const pubLower = (publisher || '').toLowerCase();
+
+  for (const cp of cve.cpeProducts) {
+    const [vendor, product] = cp.split(':');
+    const cpLower = (vendor + ' ' + product).replace(/_/g, ' ').toLowerCase();
+
+    // Check if any significant word from our software name appears in the CPE
+    for (const word of nameWords) {
+      if (cpLower.includes(word)) return true;
+    }
+    // Check publisher match
+    if (pubLower && vendor && pubLower.includes(vendor.replace(/_/g, ' '))) return true;
+  }
+
+  return false;
 }
 
 // Normalize a software name into a clean search keyword
@@ -436,8 +460,9 @@ async function searchNVDByName(keyword, nvdApiKey) {
 
     const desc = (cve.descriptions || []).find(d => d.lang === 'en')?.value || '';
 
-    // Extract version ranges from CPE configurations
+    // Extract version ranges + CPE product names from configurations
     const versionRanges = [];
+    const cpeProducts = new Set();
     for (const config of configs) {
       for (const node of (config.nodes || [])) {
         for (const match of (node.cpeMatch || [])) {
@@ -448,6 +473,11 @@ async function searchNVDByName(keyword, nvdApiKey) {
               versionEndIncluding: match.versionEndIncluding || null,
               versionEndExcluding: match.versionEndExcluding || null,
             });
+            // Extract product + vendor from CPE URI: cpe:2.3:a:vendor:product:...
+            const parts = (match.criteria || '').split(':');
+            if (parts.length >= 5) {
+              cpeProducts.add(parts[3] + ':' + parts[4]); // vendor:product
+            }
           }
         }
       }
@@ -460,6 +490,7 @@ async function searchNVDByName(keyword, nvdApiKey) {
       description: desc,
       published: cve.published || '',
       versionRanges,
+      cpeProducts: [...cpeProducts],
     };
   });
 }
@@ -542,7 +573,7 @@ async function runAudit(config) {
     // Build software grouping for NVD
     const normName = normalizeSwName(name);
     if (!softwareByName.has(normName)) {
-      softwareByName.set(normName, { rawName: name, versions: new Map() });
+      softwareByName.set(normName, { rawName: name, publisher, versions: new Map() });
     }
     const entry = softwareByName.get(normName);
     if (!entry.versions.has(version)) {
@@ -600,13 +631,17 @@ async function runAudit(config) {
     if (!cves || cves.length === 0) continue;
 
     // Match CVEs against installed versions — append to CSV file
+    const { publisher } = softwareByName.get(normName);
     const batch = [];
     for (const cve of cves) {
-      // Skip CVEs with no version range info — they're too broad to match reliably
+      // Skip CVEs with no version range info — too broad
       if (!cve.versionRanges || cve.versionRanges.length === 0) continue;
 
+      // Skip CVEs whose CPE products don't match our software
+      if (!isCVERelevant(cve, normName, publisher)) continue;
+
       for (const [version, devices] of versions) {
-        if (!version) continue; // skip entries with no version
+        if (!version) continue;
         let affected = false;
         {
           for (const range of cve.versionRanges) {
