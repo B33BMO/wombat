@@ -371,28 +371,42 @@ function isCVERelevant(cve, searchName, publisher) {
   const nameLower = searchName.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
   const pubLower = (publisher || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
 
+  // Split our software name into words for whole-word matching
+  const nameWords = nameLower.split(/\s+/).filter(w => w.length >= 3);
+
   for (const cp of cve.cpeProducts) {
     const [vendor, product] = cp.split(':');
     const prodNorm = (product || '').replace(/_/g, ' ').toLowerCase();
     const vendNorm = (vendor || '').replace(/_/g, ' ').toLowerCase();
+    const prodWords = prodNorm.split(/\s+/).filter(w => w.length >= 2);
 
-    // Strategy 1: CPE product name appears in our software name (or vice versa)
-    // e.g. CPE "chrome" in "Google Chrome", CPE "7-zip" in "7-Zip"
-    if (prodNorm.length >= 3 && nameLower.includes(prodNorm)) return true;
-    if (nameLower.length >= 3 && prodNorm.includes(nameLower)) return true;
+    // Strategy 1: CPE product name is a whole word/phrase in our software name
+    // e.g. CPE "chrome" in "google chrome", CPE "7 zip" in "7 zip 26 00"
+    if (prodNorm.length >= 3 && hasWholeWord(nameLower, prodNorm)) return true;
 
-    // Strategy 2: Publisher matches vendor
-    // e.g. publisher "Google LLC" matches vendor "google"
+    // Strategy 2: Our software name matches CPE product (must cover most of it)
+    // e.g. "firefox" matches "firefox", "chrome" matches "chrome"
+    // but "everything" should NOT match "search everything" (different product)
+    if (nameLower.length >= 3 && hasWholeWord(prodNorm, nameLower) && nameLower.length >= prodNorm.length * 0.7) return true;
+
+    // Strategy 3: Publisher matches vendor + at least one product word in name
     if (pubLower && vendNorm && vendNorm.length >= 3 && pubLower.includes(vendNorm)) {
-      // Vendor matches — also check product has some overlap with name
-      const prodWords = prodNorm.split(/\s+/).filter(w => w.length >= 3);
       for (const pw of prodWords) {
-        if (nameLower.includes(pw)) return true;
+        if (pw.length >= 3 && hasWholeWord(nameLower, pw)) return true;
       }
     }
   }
 
   return false;
+}
+
+// Check if 'word' appears as a whole word in 'text' (not as substring of another word)
+function hasWholeWord(text, word) {
+  const idx = text.indexOf(word);
+  if (idx === -1) return false;
+  const before = idx === 0 || /[\s\-_/.]/.test(text[idx - 1]);
+  const after = idx + word.length >= text.length || /[\s\-_/.]/.test(text[idx + word.length]);
+  return before && after;
 }
 
 // Normalize a software name into a clean search keyword
@@ -893,34 +907,24 @@ function buildAuditPageHTML(summary, auditStats) {
   </tr>`).join('\n  ')}
 </table>
 
-<h2>Affected Devices by Customer</h2>
-${customersSorted.map(([name, c]) => {
-  const MAX_CVES_SHOWN = 10;
-  function formatSevRow(label, color, ids) {
-    if (!ids.length) return '';
-    const shown = ids.slice(0, MAX_CVES_SHOWN).map(id => '<a href="https://nvd.nist.gov/vuln/detail/' + id + '">' + id + '</a>').join(', ');
-    const extra = ids.length > MAX_CVES_SHOWN ? ' <em>+ ' + (ids.length - MAX_CVES_SHOWN) + ' more</em>' : '';
-    return '<tr><td><span style="color:' + color + ';">' + label + ' (' + ids.length + ')</span></td><td>' + shown + extra + '</td></tr>';
-  }
+<h2>Devices with Critical CVEs</h2>
+${customersSorted.filter(([, c]) => c.CRITICAL > 0).map(([name, c]) => {
+  const critDevices = c.deviceDetails.filter(d => d.bySev.CRITICAL.length > 0);
+  if (!critDevices.length) return '';
+  const MAX = 5;
   return '<details>' +
-    '<summary><strong>' + name + '</strong> (' + c.deviceCount + ' devices, ' + c.total + ' unique CVEs)</summary>' +
-    c.deviceDetails.map(d =>
-      '<details style="margin-left:20px;">' +
-        '<summary>' + d.device + ' — ' +
-          (d.bySev.CRITICAL.length ? '<span style="color:#d32f2f;">' + d.bySev.CRITICAL.length + 'C</span> ' : '') +
-          (d.bySev.HIGH.length ? '<span style="color:#f57c00;">' + d.bySev.HIGH.length + 'H</span> ' : '') +
-          (d.bySev.MEDIUM.length ? d.bySev.MEDIUM.length + 'M ' : '') +
-          (d.bySev.LOW.length ? d.bySev.LOW.length + 'L' : '') +
-        '</summary>' +
-        '<table><tr><th>Severity</th><th>CVEs</th></tr>' +
-        formatSevRow('CRITICAL', '#d32f2f', d.bySev.CRITICAL) +
-        formatSevRow('HIGH', '#f57c00', d.bySev.HIGH) +
-        '</table>' +
-        (d.bySev.MEDIUM.length + d.bySev.LOW.length > 0 ?
-          '<p><em>' + d.bySev.MEDIUM.length + ' Medium, ' + d.bySev.LOW.length + ' Low (see CSV for details)</em></p>' : '') +
-      '</details>'
+    '<summary><strong>' + name + '</strong> (' + critDevices.length + ' devices with critical CVEs)</summary>' +
+    '<table><tr><th>Device</th><th>Critical CVEs</th><th>High</th><th>Med</th><th>Low</th></tr>' +
+    critDevices.map(d =>
+      '<tr><td>' + d.device + '</td>' +
+      '<td>' + d.bySev.CRITICAL.slice(0, MAX).map(id =>
+        '<a href="https://nvd.nist.gov/vuln/detail/' + id + '">' + id + '</a>'
+      ).join(', ') + (d.bySev.CRITICAL.length > MAX ? ' +' + (d.bySev.CRITICAL.length - MAX) + ' more' : '') + '</td>' +
+      '<td>' + d.bySev.HIGH.length + '</td>' +
+      '<td>' + d.bySev.MEDIUM.length + '</td>' +
+      '<td>' + d.bySev.LOW.length + '</td></tr>'
     ).join('') +
-  '</details>';
+    '</table></details>';
 }).join('\n')}
 `.trim();
 }
