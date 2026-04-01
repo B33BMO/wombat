@@ -7,7 +7,7 @@
  * and outputs daily CSV reports.
  */
 
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, openSync, writeSync, closeSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -313,7 +313,16 @@ function loadNVDCache() {
 }
 
 function saveNVDCache(cache) {
-  writeFileSync(NVD_CACHE_PATH, JSON.stringify(cache));
+  // Write incrementally to avoid string length limits on large caches
+  const fd = openSync(NVD_CACHE_PATH, 'w');
+  writeSync(fd, '{');
+  const keys = Object.keys(cache);
+  for (let i = 0; i < keys.length; i++) {
+    const chunk = (i > 0 ? ',' : '') + JSON.stringify(keys[i]) + ':' + JSON.stringify(cache[keys[i]]);
+    writeSync(fd, chunk);
+  }
+  writeSync(fd, '}');
+  closeSync(fd);
 }
 
 // Compact CVE for cache — minimal footprint
@@ -356,10 +365,10 @@ function expandCVE(c) {
 
 // Check if a CVE's CPE products are relevant to the software we're searching for
 function isCVERelevant(cve, searchName, publisher) {
-  if (!cve.cpeProducts || cve.cpeProducts.length === 0) return true; // no CPE data, can't filter
+  if (!cve.cpeProducts || cve.cpeProducts.length === 0) return false; // no CPE data = can't verify relevance, skip
 
   const nameLower = searchName.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
-  const nameWords = nameLower.split(/\s+/).filter(w => w.length >= 2);
+  const nameWords = nameLower.split(/\s+/).filter(w => w.length >= 3);
   const pubLower = (publisher || '').toLowerCase();
 
   for (const cp of cve.cpeProducts) {
@@ -422,7 +431,7 @@ function isVersionAffected(version, cpeMatch) {
 }
 
 async function searchNVDByName(keyword, nvdApiKey) {
-  const params = new URLSearchParams({ keywordSearch: keyword });
+  const params = new URLSearchParams({ keywordSearch: keyword, resultsPerPage: '200' });
   const headers = { 'Accept': 'application/json' };
   if (nvdApiKey) headers['apiKey'] = nvdApiKey;
 
@@ -603,6 +612,10 @@ async function runAudit(config) {
   let cveCount = 0;
   let uniqueCVEIds = new Set();
 
+  // Stats for BookStack (collected during scan to avoid re-parsing huge CSV)
+  const allCVEStats = {};     // cveId -> { severity, score, software, devices: Set }
+  const customerCVEStats = {}; // customer -> { CRITICAL: Set, HIGH: Set, ..., devices: Set }
+
   for (const normName of uniqueNames) {
     checked++;
     const { versions, rawName } = softwareByName.get(normName);
@@ -651,9 +664,20 @@ async function runAudit(config) {
 
         if (affected) {
           uniqueCVEIds.add(cve.cveId);
+          if (!allCVEStats[cve.cveId]) allCVEStats[cve.cveId] = { severity: cve.severity, score: cve.score, software: rawName, devices: new Set() };
+
           for (const dev of devices) {
             batch.push(toCSVRow([cve.cveId, cve.severity, cve.score, rawName, version, dev.customer, dev.device, cve.published, cve.description]));
             cveCount++;
+
+            // Collect stats
+            allCVEStats[cve.cveId].devices.add(dev.device);
+            if (!customerCVEStats[dev.customer]) customerCVEStats[dev.customer] = {
+              CRITICAL: new Set(), HIGH: new Set(), MEDIUM: new Set(), LOW: new Set(), UNKNOWN: new Set(), devices: new Set(),
+            };
+            const cs = customerCVEStats[dev.customer];
+            (cs[cve.severity] || cs.UNKNOWN).add(cve.cveId);
+            cs.devices.add(dev.device);
           }
         }
       }
@@ -702,8 +726,33 @@ ${colors.bold}Audit Summary — ${dateStr}${colors.reset}
   Output:               ${dayDir}/
 `);
 
-  // Step 5: Publish to BookStack
-  await publishToBookStack(config, summary, cvePath);
+  // Step 5: Build stats and publish to BookStack
+  const sevCounts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, UNKNOWN: 0 };
+  for (const info of Object.values(allCVEStats)) {
+    if (sevCounts[info.severity] !== undefined) sevCounts[info.severity]++;
+    else sevCounts['UNKNOWN']++;
+  }
+
+  const topCVEs = Object.entries(allCVEStats)
+    .map(([id, v]) => [id, { ...v, count: v.devices.size }])
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 20);
+
+  const customersSorted = Object.entries(customerCVEStats)
+    .map(([name, sets]) => [name, {
+      CRITICAL: sets.CRITICAL.size,
+      HIGH: sets.HIGH.size,
+      MEDIUM: sets.MEDIUM.size,
+      LOW: sets.LOW.size,
+      total: new Set([...sets.CRITICAL, ...sets.HIGH, ...sets.MEDIUM, ...sets.LOW, ...sets.UNKNOWN]).size,
+      deviceCount: sets.devices.size,
+      deviceList: [...sets.devices].sort(),
+    }])
+    .sort((a, b) => b[1].CRITICAL - a[1].CRITICAL || b[1].total - a[1].total);
+
+  const auditStats = { sevCounts, topCVEs, customersSorted };
+
+  await publishToBookStack(config, summary, auditStats);
 }
 
 // ---------------------------------------------------------------------------
@@ -757,72 +806,8 @@ async function findOrCreateChapter(config, bookId, chapterName) {
   return chapter.id;
 }
 
-function buildAuditPageHTML(summary, cvePath) {
-  // Read CVE data and build summary tables
-  const cveLines = readFileSync(cvePath, 'utf8').split('\n').filter(l => l.trim());
-  const header = cveLines[0];
-  const rows = cveLines.slice(1);
-
-  // Track unique CVEs globally and per-customer
-  const allCVEs = {};         // cveId -> { severity, score, software, devices: Set }
-  const customerCVEs = {};    // customer -> { CRITICAL: Set, HIGH: Set, MEDIUM: Set, LOW: Set }
-
-  for (const row of rows) {
-    // Parse CSV row — handle quoted fields
-    const fields = [];
-    let field = '';
-    let inQuote = false;
-    for (let i = 0; i < row.length; i++) {
-      const ch = row[i];
-      if (ch === '"') { inQuote = !inQuote; continue; }
-      if (ch === ',' && !inQuote) { fields.push(field); field = ''; continue; }
-      field += ch;
-    }
-    fields.push(field);
-
-    const [cveId, severity, score, software, version, customer, device] = fields;
-    if (!cveId) continue;
-
-    // Track unique CVE -> unique devices affected
-    if (!allCVEs[cveId]) allCVEs[cveId] = { severity, score, software, devices: new Set() };
-    allCVEs[cveId].devices.add(device);
-
-    // Track unique CVEs and devices per customer per severity
-    if (!customerCVEs[customer]) customerCVEs[customer] = {
-      CRITICAL: new Set(), HIGH: new Set(), MEDIUM: new Set(), LOW: new Set(), UNKNOWN: new Set(),
-      devices: new Set(),
-    };
-    const custEntry = customerCVEs[customer];
-    const bucket = custEntry[severity] || custEntry['UNKNOWN'];
-    bucket.add(cveId);
-    custEntry.devices.add(device);
-  }
-
-  // Severity counts (unique CVEs)
-  const sevCounts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, UNKNOWN: 0 };
-  for (const [cveId, info] of Object.entries(allCVEs)) {
-    if (sevCounts[info.severity] !== undefined) sevCounts[info.severity]++;
-    else sevCounts['UNKNOWN']++;
-  }
-
-  // Top CVEs by unique device count
-  const topCVEs = Object.entries(allCVEs)
-    .map(([id, v]) => [id, { ...v, count: v.devices.size }])
-    .sort((a, b) => b[1].count - a[1].count)
-    .slice(0, 20);
-
-  // Customer table: unique CVE counts per severity + device list
-  const customersSorted = Object.entries(customerCVEs)
-    .map(([name, sets]) => [name, {
-      CRITICAL: sets.CRITICAL.size,
-      HIGH: sets.HIGH.size,
-      MEDIUM: sets.MEDIUM.size,
-      LOW: sets.LOW.size,
-      total: new Set([...sets.CRITICAL, ...sets.HIGH, ...sets.MEDIUM, ...sets.LOW, ...sets.UNKNOWN]).size,
-      deviceCount: sets.devices.size,
-      deviceList: [...sets.devices].sort(),
-    }])
-    .sort((a, b) => b[1].CRITICAL - a[1].CRITICAL || b[1].total - a[1].total);
+function buildAuditPageHTML(summary, auditStats) {
+  const { sevCounts, topCVEs, customersSorted } = auditStats;
 
   return `
 <h2>Audit Summary</h2>
@@ -881,7 +866,7 @@ ${customersSorted.map(([name, c]) => `<details>
 `.trim();
 }
 
-async function publishToBookStack(config, summary, cvePath) {
+async function publishToBookStack(config, summary, auditStats) {
   if (!config.bookstackToken || !config.bookstackUrl) {
     warn('BookStack not configured. Run: wombat-audit setup');
     return;
@@ -906,7 +891,7 @@ async function publishToBookStack(config, summary, cvePath) {
       `pages?filter[chapter_id]=${chapterId}&filter[name]=${encodeURIComponent(pageName)}`);
     const existingPage = (existingPages.data || []).find(p => p.name === pageName);
 
-    const html = buildAuditPageHTML(summary, cvePath);
+    const html = buildAuditPageHTML(summary, auditStats);
 
     if (existingPage) {
       await bookstackFetch(config, `pages/${existingPage.id}`, 'PUT', {
