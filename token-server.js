@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
 import { createServer } from 'http';
+import { request as httpsRequest } from 'https';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { URL } from 'url';
 
 import { homedir } from 'os';
 import { mkdirSync } from 'fs';
@@ -12,6 +14,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = join(homedir(), '.wombat');
 const ENV_PATH = join(CONFIG_DIR, 'atera-token');
 const UNICORN_TOKEN_PATH = join(CONFIG_DIR, 'unicorn-token');
+const ENDPOINTS_PATH = join(CONFIG_DIR, 'discovered-endpoints.json');
 const PORT = 7847;
 
 // Ensure config directory exists
@@ -43,11 +46,66 @@ function getUnicornToken() {
   return readFileSync(UNICORN_TOKEN_PATH, 'utf8').trim();
 }
 
+// Discovered endpoints functions
+function getEndpoints() {
+  if (!existsSync(ENDPOINTS_PATH)) return { endpoints: {} };
+  try {
+    return JSON.parse(readFileSync(ENDPOINTS_PATH, 'utf8'));
+  } catch (e) {
+    return { endpoints: {} };
+  }
+}
+
+function saveEndpoints(data) {
+  writeFileSync(ENDPOINTS_PATH, JSON.stringify(data, null, 2));
+}
+
+function addEndpoint(entry) {
+  const data = getEndpoints();
+  const key = `${entry.method}:${entry.url}`;
+
+  if (!data.endpoints[key]) {
+    data.endpoints[key] = {
+      method: entry.method,
+      url: entry.url,
+      firstSeen: entry.timestamp,
+      lastSeen: entry.timestamp,
+      count: 1,
+      samples: []
+    };
+  } else {
+    data.endpoints[key].lastSeen = entry.timestamp;
+    data.endpoints[key].count++;
+  }
+
+  // Keep last 3 samples of request/response
+  const samples = data.endpoints[key].samples;
+  samples.unshift({
+    timestamp: entry.timestamp,
+    requestBody: entry.requestBody,
+    status: entry.status,
+    responseBody: entry.responseBody
+  });
+  data.endpoints[key].samples = samples.slice(0, 3);
+
+  saveEndpoints(data);
+  return data.endpoints[key];
+}
+
 const server = createServer((req, res) => {
   // CORS headers for browser requests - allow both Atera and Unicorn
   const origin = req.headers.origin;
-  const allowedOrigins = ['https://app.atera.com', 'https://unicorn.cyburity.com'];
-  if (allowedOrigins.includes(origin)) {
+  const allowedOrigins = [
+    'https://app.atera.com',
+    'https://unicorn.cyburity.com',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5174',
+    'http://127.0.0.1:3000',
+  ];
+  if (allowedOrigins.includes(origin) || origin?.startsWith('http://localhost:')) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -129,6 +187,107 @@ const server = createServer((req, res) => {
     return;
   }
 
+  // Endpoint discovery
+  if (req.method === 'POST' && req.url === '/endpoints') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const entry = JSON.parse(body);
+        const endpoint = addEndpoint(entry);
+        const timestamp = new Date().toLocaleTimeString();
+        console.log(`[${timestamp}] Endpoint: ${entry.method} ${entry.url} (seen ${endpoint.count}x)`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, count: endpoint.count }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && req.url === '/endpoints') {
+    const data = getEndpoints();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+    return;
+  }
+
+  if (req.method === 'GET' && req.url === '/endpoints/summary') {
+    const data = getEndpoints();
+    const summary = Object.values(data.endpoints).map(e => ({
+      method: e.method,
+      url: e.url,
+      count: e.count,
+      lastSeen: e.lastSeen
+    })).sort((a, b) => b.count - a.count);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(summary));
+    return;
+  }
+
+  // Atera API Proxy - forwards requests to app.atera.com
+  if (req.url.startsWith('/atera/')) {
+    const token = getAteraToken();
+    if (!token) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No Atera token available' }));
+      return;
+    }
+
+    const ateraPath = req.url.slice(6); // Remove '/atera' prefix
+    const ateraUrl = new URL(`https://app.atera.com${ateraPath}`);
+
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      // For POST requests, default to empty JSON object if no body
+      if (req.method === 'POST' && !body) {
+        body = '{}';
+      }
+
+      const options = {
+        hostname: ateraUrl.hostname,
+        port: 443,
+        path: ateraUrl.pathname + ateraUrl.search,
+        method: req.method,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': token.startsWith('Bearer ') ? token : `Bearer ${token}`,
+          'Accept': 'application/json',
+        }
+      };
+
+      if (body) {
+        options.headers['Content-Length'] = Buffer.byteLength(body);
+      }
+
+      const proxyReq = httpsRequest(options, (proxyRes) => {
+        let responseData = '';
+        proxyRes.on('data', chunk => responseData += chunk);
+        proxyRes.on('end', () => {
+          const timestamp = new Date().toLocaleTimeString();
+          console.log(`[${timestamp}] Proxy: ${req.method} ${ateraPath} -> ${proxyRes.statusCode}`);
+          res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json' });
+          res.end(responseData);
+        });
+      });
+
+      proxyReq.on('error', (e) => {
+        console.error('Proxy error:', e.message);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Proxy request failed', details: e.message }));
+      });
+
+      if (body) {
+        proxyReq.write(body);
+      }
+      proxyReq.end();
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -136,22 +295,26 @@ const server = createServer((req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`
 ┌─────────────────────────────────────────────────┐
-│   Auth Token Server                             │
+│   Wombat Server                                 │
 │   Listening on http://127.0.0.1:${PORT}            │
 ├─────────────────────────────────────────────────┤
 │   Endpoints:                                    │
-│     /token         - Atera tokens               │
-│     /unicorn/token - Unicorn tokens             │
+│     /token            - Atera tokens            │
+│     /unicorn/token    - Unicorn tokens          │
+│     /endpoints        - Discovered API routes   │
+│     /endpoints/summary - API route summary      │
 ├─────────────────────────────────────────────────┤
-│   Install Tampermonkey scripts, then open       │
-│   Atera/Unicorn in browser to sync tokens.      │
+│   Install Tampermonkey scripts to sync.         │
 └─────────────────────────────────────────────────┘
 `);
 
   const ateraToken = getAteraToken();
   const unicornToken = getUnicornToken();
+  const endpointData = getEndpoints();
+  const endpointCount = Object.keys(endpointData.endpoints).length;
   console.log(`Atera token:   ${ateraToken ? 'Found' : 'Not set'}`);
   console.log(`Unicorn token: ${unicornToken ? 'Found' : 'Not set'}`);
+  console.log(`Endpoints:     ${endpointCount} discovered`);
   console.log('');
 });
 

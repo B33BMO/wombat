@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Wombat API Sniffer
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Captures Atera API calls for reverse engineering
+// @version      2.0
+// @description  Captures Atera API calls and sends to local server
 // @author       wombat
 // @match        https://app.atera.com/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
 // @run-at       document-start
 // ==/UserScript==
 
@@ -13,6 +14,32 @@
     'use strict';
 
     const captured = [];
+    const TOKEN_SERVER = 'http://127.0.0.1:7847';
+
+    function sendToServer(entry) {
+        // Use GM_xmlhttpRequest for cross-origin to localhost
+        if (typeof GM_xmlhttpRequest !== 'undefined') {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: TOKEN_SERVER + '/endpoints',
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify(entry),
+                onload: function(response) {
+                    // Silent success
+                },
+                onerror: function(error) {
+                    // Server not running, ignore
+                }
+            });
+        } else {
+            // Fallback to fetch
+            fetch(TOKEN_SERVER + '/endpoints', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(entry)
+            }).catch(() => {});
+        }
+    }
 
     // Intercept fetch
     const originalFetch = window.fetch;
@@ -38,6 +65,7 @@
                 };
 
                 captured.push(entry);
+                sendToServer(entry);
                 console.log(`%c[Wombat] ${entry.method} ${url}`, 'color: #00ff88; font-weight: bold');
                 console.log('  Request:', options.body ? JSON.parse(options.body) : null);
                 console.log('  Response:', body.length > 500 ? body.substring(0, 500) + '...' : body);
@@ -75,6 +103,7 @@
                 };
 
                 captured.push(entry);
+                sendToServer(entry);
                 console.log(`%c[Wombat] ${entry.method} ${url}`, 'color: #00ff88; font-weight: bold');
                 console.log('  Request:', body ? JSON.parse(body) : null);
                 console.log('  Response:', xhr.responseText?.length > 500 ? xhr.responseText.substring(0, 500) + '...' : xhr.responseText);
@@ -97,5 +126,6 @@
     };
 
     console.log('%c[Wombat] API Sniffer Active', 'color: #00ff88; font-size: 14px; font-weight: bold');
-    console.log('%cCapturing /proxy/ API calls. Run wombatExport() to get captured data.', 'color: #888');
+    console.log('%cCapturing /proxy/ API calls. Auto-syncing to localhost:7847', 'color: #888');
+    console.log('%cRun wombatExport() to get captured data locally.', 'color: #888');
 })();
